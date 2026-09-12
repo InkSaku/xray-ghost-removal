@@ -1,0 +1,22 @@
+# Data, transferred separately, see DATA.md
+data/
+*.dcm
+
+# Outputs
+results/
+figures/
+experiments/
+*.pt
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS and editor
+.DS_Store
+.vscode/
+.idea/

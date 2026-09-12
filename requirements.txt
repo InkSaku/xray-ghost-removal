@@ -1,0 +1,16 @@
+# Core, required by everything
+numpy>=1.24.0
+scipy>=1.10.0
+pydicom>=2.4.0
+matplotlib>=3.7.0
+
+# U-Net training only, see scripts/train_unet.py and scripts/diagnose_model.py.
+# Install the CUDA build for GPU training, see scripts/setup_remote.sh.
+torch>=2.0.0
+
+# Optional. For reading data/raw/AI修残影例图/拍摄参数记录.xlsx.
+# No script imports it yet, that dataset is unprocessed.
+openpyxl>=3.1.0
+
+# Tests
+pytest>=7.3.0
