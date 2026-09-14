@@ -1,124 +1,129 @@
-# Real Paired-Data Acquisition Protocol for Ghost Removal
+# 用于残影去除的真实配对数据采集协议
 
 
-> **Handover note added 2026-09-12.** This is the original design record, kept as written.
-> Some performance figures in it, in particular the 97% reduction on image 4, and the
-> description of `run_ghost_removal.py` as the confidence-gated linear remover, were not
-> reproduced when the code was re-run on 2026-09-12. See `RESULTS.md` in the repository root
-> for the re-measured numbers before quoting anything here.
+> **2026-09-14 交接更新。** 2026 年 7 月取得的 62 张 `N-dark / N-light` 图像已经完成
+> 阶段 0–2 分析，但它们不是本文定义的 ground-truth 配对。结果显示主要候选关系是
+> `light_(N-1) → dark_N`，且 17/30 张 dark 支持多帧记忆，因此不能把 dark 整批当作
+> clean reference。全部 DICOM 均缺少 `AcquisitionTime`；`InstanceCreationTime` 只用于审计，
+> 不能据此拟合时间衰减。本文的三元组采集仍然必要，尤其要用设备侧可靠记录或外部计时
+> 明确保存 `time_gap_seconds`。当前数字和限制见根目录 `RESULTS.md` 第 4 节。
 
-> **Date**: 2026-05-28
-> **Purpose**: Acquire ground-truth (clean, ghosted) pairs so ghost removal can be validated and trained on real physics instead of synthetic assumptions.
 
----
+> **2026-09-12 添加的交接说明。** 本文件是原始设计记录，内容按原样保留。
+> 其中部分性能数字，尤其是第 4 张图残影减少 97% 的说法，以及把 `run_ghost_removal.py` 描述为带置信度门控的线性去除器的说法，在 2026-09-12 重新运行代码时均未能复现。在引用本文件中的任何结果之前，请先查看仓库根目录中的 `RESULTS.md`，以获取重新测量后的数字。
 
-## Why this is needed
-
-Every method tried so far (physics linear subtraction, diffusion inpainting, U-Net with synthetic data) hit the same wall: **no ground truth**. We can verify removal only when the ghost is strong and clean (e.g. image 4, 97% reduction), because there we can see it. For weak ghosts buried in air noise, we cannot tell whether an estimated coefficient is right, so every estimator either under- or over-corrects, and no amount of tuning fixes this.
-
-What we *did* prove: the ghost is linear, `current = true + sum_k alpha_k * (previous_k - bg_k)`, and for a clean case `alpha ~= 0.0085`. The single unknown blocking reliable removal is **how alpha behaves** across exposure level, position, and time between exposures. Real paired data measures this directly.
+> **日期**：2026-05-28
+> **目的**：采集带真实标签的（干净图、带残影图）图像对，使残影去除算法能够基于真实物理过程进行验证和训练，而不是依赖合成假设。
 
 ---
 
-## What a "pair" is
+## 为什么需要这些数据
 
-| File | How it is captured | Role |
+到目前为止尝试过的所有方法（基于物理的线性相减、扩散修补、使用合成数据训练的 U-Net）都遇到了同一个瓶颈：**没有真实标签**。我们只能在残影强且清晰的情况下验证去除效果（例如第 4 张图，减少 97%），因为这时残影肉眼可见。对于被空气区域噪声淹没的弱残影，我们无法判断估计出的系数是否正确，因此每一种估计器都会产生校正不足或校正过度的问题，而继续调参也无法解决这个根本问题。
+
+我们*已经*证明的是：残影满足线性模型，`current = true + sum_k alpha_k * (previous_k - bg_k)`，并且对于一个干净样例，`alpha ~= 0.0085`。当前阻碍可靠去除的唯一未知因素是：**alpha 会如何随曝光水平、位置以及两次曝光之间的时间间隔变化**。真实配对数据可以直接测量这些关系。
+
+---
+
+## 什么叫一组“配对数据”
+
+| 文件 | 采集方式 | 作用 |
 |------|-------------------|------|
-| `clean.dcm` | Image of object A on a **fully erased** plate | Ground-truth target (no ghost) |
-| `previous.dcm` | Image of object B (the ghost source) | Known ghost source |
-| `ghosted.dcm` | Image of object A again, on the plate **after** B's exposure (not fully erased) | Input with a real ghost of B |
+| `clean.dcm` | 在**完全擦除**的成像板上拍摄物体 A | 真实标签目标（无残影） |
+| `previous.dcm` | 拍摄物体 B（残影来源） | 已知残影源 |
+| `ghosted.dcm` | 在完成 B 的曝光后、成像板**未完全擦除**的情况下再次拍摄物体 A | 包含 B 真实残影的输入图像 |
 
-With `clean` as ground truth, the real ghost is exactly `ghosted - clean`, and the true coefficient is `alpha = mean((ghosted - clean)) / mean((previous - bg))` in the relevant region. No assumptions.
-
----
-
-## Acquisition procedure (per pair)
-
-1. **Fully erase** the CR plate (run the reader's erase cycle, or expose to bright light per vendor spec, then read-and-discard).
-2. Image **object A**. Save as `clean.dcm`. This is the ghost-free reference.
-3. **Fully erase** again.
-4. Image **object B**. Save as `previous.dcm`. (B is the ghost source.)
-5. **Without fully erasing**, immediately image **object A** again. Save as `ghosted.dcm`.
-6. Record metadata for the pair (see below).
-
-The critical control: steps 2 and 5 image the **same object A in the same position**, so `ghosted - clean` isolates exactly the ghost of B. Keep A and the tube/plate geometry fixed between steps 2 and 5.
+有了 `clean` 作为真实标签，真实残影就精确等于 `ghosted - clean`，而相关区域中的真实系数可以计算为 `alpha = mean((ghosted - clean)) / mean((previous - bg))`。不需要任何假设。
 
 ---
 
-## What to vary across pairs (to map alpha)
+## 采集流程（每一组配对数据）
 
-Capture pairs spanning these axes so the model/estimator learns how alpha changes:
+1. **完全擦除** CR 成像板（运行读片器的擦除周期，或者按照厂商规范使用强光曝光，然后读取并丢弃该图像）。
+2. 拍摄**物体 A**。保存为 `clean.dcm`。这是无残影参考图像。
+3. 再次**完全擦除**成像板。
+4. 拍摄**物体 B**。保存为 `previous.dcm`。（B 是残影来源。）
+5. **不要完全擦除成像板**，立即再次拍摄**物体 A**。保存为 `ghosted.dcm`。
+6. 记录这一组图像的元数据（见下文）。
 
-| Variable | Range to cover | Why |
+关键控制条件是：步骤 2 和步骤 5 拍摄的是**同一个物体 A，并且位置完全相同**，这样 `ghosted - clean` 才能精确隔离出物体 B 的残影。在步骤 2 和步骤 5 之间，应保持物体 A 以及 X 射线管/成像板几何位置固定不变。
+
+---
+
+## 不同配对数据之间需要改变哪些条件（用于建立 alpha 的变化规律）
+
+采集的数据应覆盖下列变化维度，从而让模型/估计器学习 alpha 的变化规律：
+
+| 变量 | 需要覆盖的范围 | 原因 |
 |----------|---------------|-----|
-| Exposure of ghost source B | low / medium / high mAs | alpha likely scales with B's dose |
-| Time gap between B and ghosted A | immediate, 30 s, 2 min | phosphor residual decays over time |
-| Object B type | sharp-edged, large flat, fine structure | tests spatial fidelity of the ghost |
-| Position on plate | center, edges, corners | tests spatial variation of alpha |
-| Exposure of A | low / normal | tests interaction with the underlying image |
+| 残影源 B 的曝光量 | 低 / 中 / 高 mAs | alpha 很可能随 B 的剂量变化 |
+| B 与随后拍摄的带残影 A 之间的时间间隔 | 立即、30 秒、2 分钟 | 磷光残留会随时间衰减 |
+| 物体 B 的类型 | 边缘锐利、大面积平坦、细小结构 | 测试残影的空间保真性 |
+| 成像板上的位置 | 中心、边缘、角落 | 测试 alpha 的空间变化 |
+| A 的曝光量 | 低 / 正常 | 测试残影与当前底层图像之间的相互作用 |
 
-**Target: 50-100 pairs.** Even 20-30 well-spread pairs are enough to measure alpha's behavior and validate the linear model.
+**目标：50-100 组。** 即使只有 20-30 组分布合理的配对数据，也足以测量 alpha 的变化规律并验证线性模型。
 
 ---
 
-## Directory layout
+## 目录结构
 
 ```
 data/raw/paired/
 ├── pair_001/
-│   ├── clean.dcm        # object A, erased plate (ground truth)
-│   ├── previous.dcm     # object B (ghost source)
-│   ├── ghosted.dcm      # object A again, after B (real ghost)
-│   └── meta.json        # see below
+│   ├── clean.dcm        # 物体 A，已擦除成像板（真实标签）
+│   ├── previous.dcm     # 物体 B（残影来源）
+│   ├── ghosted.dcm      # 再次拍摄物体 A，位于 B 之后（真实残影）
+│   └── meta.json        # 见下文
 ├── pair_002/
 └── ...
 ```
 
-`meta.json` per pair:
+每一组配对数据对应的 `meta.json`：
 ```json
 {
-  "object_A": "aluminum step wedge",
-  "object_B": "circular phantom",
+  "object_A": "铝制阶梯楔",
+  "object_B": "圆形模体",
   "kvp": 70,
   "mas_B": 5.0,
   "mas_A": 4.0,
   "time_gap_seconds": 30,
   "position": "center",
-  "notes": "fully erased before clean and before previous"
+  "notes": "在拍摄 clean 和 previous 之前均进行了完全擦除"
 }
 ```
 
 ---
 
-## How this data unblocks each method
+## 这些数据如何解除每种方法的瓶颈
 
-1. **Validate the linear model.** Compute `alpha_true = (ghosted - clean) / (previous - bg)` per pair. If alpha is stable and the residual `ghosted - clean - alpha*(previous-bg)` is near zero, the linear model is confirmed and we can deploy the simple subtractor with a calibrated alpha (and its dependence on exposure/time).
+1. **验证线性模型。** 对每组数据计算 `alpha_true = (ghosted - clean) / (previous - bg)`。如果 alpha 保持稳定，并且残差 `ghosted - clean - alpha*(previous-bg)` 接近 0，就可以确认线性模型成立。之后可以使用经过校准的 alpha（以及它与曝光量/时间之间的关系）部署简单的减法去除器。
 
-2. **Calibrate the gated remover.** Replace the R^2 confidence heuristic with a real alpha prior. Set `alpha_cap` and the time/exposure dependence from measured values, removing the guesswork that currently forces us to skip noisy images.
+2. **校准带门控的去除器。** 使用真实的 alpha 先验替换 R² 置信度启发式。根据实测数据设定 `alpha_cap` 以及 alpha 与时间/曝光的依赖关系，从而消除目前迫使我们跳过噪声图像的猜测成分。
 
-3. **Train the U-Net with real supervision.** Use `(ghosted, previous)` as input and `clean` as target. This removes the synthetic-ghost assumption that was the root weakness. With real targets, the alpha ambiguity disappears because the network sees the true mapping.
-
----
-
-## Minimum viable first batch
-
-If acquiring 50-100 pairs is a lot up front, start with **10 pairs** varying only exposure of B (5 levels x 2 repeats) at center position, immediate gap. That alone will:
-- confirm the linear model on real data,
-- give the alpha-vs-dose curve,
-- let us replace the current heuristic gate with a calibrated one.
-
-Then expand to position and time-gap variation.
+3. **使用真实监督训练 U-Net。** 使用 `(ghosted, previous)` 作为输入，`clean` 作为目标。这样就不再依赖合成残影假设，而这正是当前方法的根本薄弱点。有了真实目标后，由于网络直接看到真实映射关系，alpha 的歧义也随之消失。
 
 ---
 
-## Current deliverable (works today, no new data)
+## 最小可行的第一批数据
 
-`scripts/run_ghost_removal.py` runs the confidence-gated linear remover:
-- cleans strong, clean ghosts (image 4: 97% reduction),
-- leaves low-confidence images untouched (safe for QC - never corrupts),
-- outputs cleaned DICOMs + comparison figures + a per-image log.
+如果一开始采集 50-100 组数据工作量太大，可以先采集 **10 组**，只改变 B 的曝光量（5 个级别 × 每个级别重复 2 次），位置固定在中心，时间间隔设为立即拍摄。仅这些数据就足以：
+- 在真实数据上确认线性模型；
+- 得到 alpha 与剂量之间的曲线；
+- 用经过校准的门控策略替代当前启发式门控。
 
-This is the safe interim tool until real paired data enables full-coverage removal.
+之后再扩展到不同位置和不同时间间隔。
+
+---
+
+## 当前可交付结果（现在即可运行，不需要新数据）
+
+`scripts/run_ghost_removal.py` 会运行带置信度门控的线性去除器：
+- 清理强而清晰的残影（第 4 张图：减少 97%）；
+- 对低置信度图像保持原样（适合 QC——绝不破坏图像）；
+- 输出清理后的 DICOM + 对比图 + 逐图像日志。
+
+在获得真实配对数据、从而实现全覆盖去除之前，这是当前安全的临时工具。
 ```
 python scripts/run_ghost_removal.py
 ```

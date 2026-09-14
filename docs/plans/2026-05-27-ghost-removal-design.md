@@ -1,161 +1,167 @@
-# X-Ray Ghost Artifact Removal - Design Document
+# X 射线残影伪影去除——设计文档
 
 
-> **Handover note added 2026-09-12.** This is the original design record, kept as written.
-> Some performance figures in it, in particular the 97% reduction on image 4, and the
-> description of `run_ghost_removal.py` as the confidence-gated linear remover, were not
-> reproduced when the code was re-run on 2026-09-12. See `RESULTS.md` in the repository root
-> for the re-measured numbers before quoting anything here.
+> **2026-09-14 交接更新。** 本文继续作为 2026-05-27 的历史设计记录，不代表当前实现状态。
+> 62 张 dark/light 图像的阶段 0–2 稳健性分析已经完成：主要因果候选为
+> `light_(N-1) → dark_N`，30 组中 5 组稳健确认、21 组参数敏感、4 组未检出，
+> 17/30 张 dark 支持多帧记忆。由于 62 张 DICOM 均缺少 `AcquisitionTime`，
+> `InstanceCreationTime` 已被排除在拟合和物理解释之外；本文关于时间依赖的内容仍是计划，
+> 不是当前结论。现有 alpha/lag 估计也不应直接用于修改合成生成器。当前事实以根目录
+> `RESULTS.md` 第 4 节为准。
 
-> **Date**: 2026-05-27
-> **Status**: Approved
-> **Goal**: Remove ghost (residual) artifacts from sequential CR X-ray images
 
----
+> **2026-09-12 添加的交接说明。** 本文件是原始设计记录，内容按原样保留。
+> 其中部分性能数字，尤其是第 4 张图残影减少 97% 的说法，以及把 `run_ghost_removal.py` 描述为带置信度门控的线性去除器的说法，在 2026-09-12 重新运行代码时均未能复现。在引用本文件中的任何结果之前，请先查看仓库根目录中的 `RESULTS.md`，以获取重新测量后的数字。
 
-## Problem
-
-Computed Radiography (CR) systems use phosphor plates that retain a residual image from previous exposures when not fully erased. The result is that image N contains faint "ghost" shapes from images N-1, N-2, etc. These ghosts become visible under adjusted window/level settings and compromise image quality.
-
-**Data**: 30 sequential DICOM images (3048x2548, 16-bit, MONOCHROME2 CR) in `data/raw/残影图像/`. More paired data can be acquired from the CR system.
-
-**Objective**: Given a ghosted image and its preceding image(s), produce a cleaned version containing only the current examination.
+> **日期**：2026-05-27
+> **状态**：已批准
+> **目标**：去除连续 CR X 射线图像中的残影（残留）伪影
 
 ---
 
-## Approach
+## 问题描述
 
-Two-phase strategy. Phase 1 (physics-based subtraction) serves as a baseline and informs synthetic data generation. Phase 2 (U-Net) is the primary model.
+计算机放射成像（Computed Radiography，CR）系统使用磷光成像板。当成像板没有被完全擦除时，会保留前一次曝光的残留图像。结果是，第 N 张图像中会出现第 N-1、N-2 等前序图像的微弱“残影”形状。这些残影在调整窗位/窗宽后会变得可见，并降低图像质量。
 
-### Phase 1: Physics-Based Subtraction
+**数据**：`data/raw/残影图像/` 中包含 30 张连续 DICOM 图像（3048x2548、16-bit、MONOCHROME2 CR）。可以从 CR 系统进一步采集配对数据。
 
-Model the observed image as a linear mixture:
+**目标**：给定一张带残影的图像以及它前面的一个或多个图像，生成只包含当前检查内容的干净图像。
+
+---
+
+## 方法
+
+采用两个阶段的策略。阶段 1（基于物理的减法）作为基线，同时为合成数据生成提供依据。阶段 2（U-Net）作为主要模型。
+
+### 阶段 1：基于物理的减法
+
+把观测图像建模为线性混合：
 
 ```
 I_obs(n) = I_true(n) + α₁·I_obs(n-1) + α₂·I_obs(n-2) + noise
 ```
 
-**Coefficient estimation**: Identify background regions in image N (regions with minimal true signal) and regress pixel values against corresponding pixels in image N-1. The slope gives α₁. Repeat for N-2 to get α₂.
+**系数估计**：识别第 N 张图像中的背景区域（真实信号最小的区域），并将这些位置上的像素值与第 N-1 张图像相同位置的像素值进行回归。回归斜率得到 α₁。对第 N-2 张图像重复同样操作得到 α₂。
 
-**Ghost removal**: Subtract the estimated ghost contribution and clamp to valid range:
+**残影去除**：减去估计出的残影贡献，并把结果限制在有效数值范围内：
 
 ```
 I_clean(n) = clamp(I_obs(n) - α₁·I_obs(n-1) - α₂·I_obs(n-2))
 ```
 
-### Phase 2: U-Net with Paired Training Data
+### 阶段 2：使用配对训练数据的 U-Net
 
-**Architecture**: U-Net with ResNet34 encoder (ImageNet pre-trained, adapted to single-channel). Input is a 3-channel tensor [current_image, previous_image_1, previous_image_2]. Output is a single-channel cleaned image.
+**网络结构**：使用带 ResNet34 编码器的 U-Net（ImageNet 预训练，并适配为单通道）。输入是一个 3 通道张量 `[current_image, previous_image_1, previous_image_2]`。输出是一张单通道的干净图像。
 
-**Training data** (three tiers):
+**训练数据**（三个层级）：
 
-| Tier | Source | Volume | Purpose |
-|------|--------|--------|---------|
-| Synthetic | Clean images blended with ghost fractions from Phase 1 | ~5,000 pairs | Pre-training |
-| Semi-real | Phase 1 cleaned images as pseudo ground truth | ~28 pairs | Bootstrapping |
-| Real paired | Same object on fresh vs. ghosted plate (user acquires) | 50-100 pairs | Fine-tuning |
+| 层级 | 来源 | 数量 | 用途 |
+|------|--------|---------|---------|
+| 合成数据 | 将干净图像与阶段 1 得到的残影比例混合 | 约 5,000 对 | 预训练 |
+| 半真实数据 | 使用阶段 1 清理后的图像作为伪真实标签 | 约 28 对 | 启动训练 |
+| 真实配对数据 | 同一物体在全新/干净成像板与带残影成像板上的图像（由用户采集） | 50-100 对 | 微调 |
 
-**Loss**: L1 + SSIM + perceptual (VGG feature matching).
+**损失函数**：L1 + SSIM + 感知损失（VGG 特征匹配）。
 
-**Training recipe**: Pre-train on synthetic → fine-tune on real paired data.
-
----
-
-## Data Acquisition Protocol (for real paired data)
-
-1. Fully erase the CR plate
-2. Image object A on erased plate → `clean.dcm` (ground truth)
-3. Image object B on same plate without full erase (creates ghost of B on plate)
-4. Image object A again → `ghosted.dcm` (contains ghost of B)
-5. Save `previous.dcm` (image of B, the ghost source)
-6. Repeat with varied objects, exposures, and positions. Target: 50-100 pairs.
+**训练方案**：先在合成数据上预训练，再在真实配对数据上微调。
 
 ---
 
-## Directory Structure
+## 数据采集协议（用于真实配对数据）
+
+1. 完全擦除 CR 成像板
+2. 在已擦除成像板上拍摄物体 A → `clean.dcm`（真实标签）
+3. 在同一块成像板上拍摄物体 B，但不进行完全擦除（在板上制造 B 的残影）
+4. 再次拍摄物体 A → `ghosted.dcm`（其中包含 B 的残影）
+5. 保存 `previous.dcm`（物体 B 的图像，即残影来源）
+6. 使用不同物体、不同曝光参数和不同位置重复上述过程。目标：50-100 对
+
+---
+
+## 目录结构
 
 ```
 data/
 ├── raw/
-│   ├── 残影图像/               # Existing 30 sequential images
-│   └── paired/                 # New paired acquisitions
+│   ├── 残影图像/               # 已有的 30 张连续图像
+│   └── paired/                 # 新采集的配对数据
 │       ├── pair_001/
-│       │   ├── clean.dcm       # Ground truth (no ghost)
-│       │   ├── ghosted.dcm     # Image with ghost artifact
-│       │   └── previous.dcm    # Image that caused the ghost
+│       │   ├── clean.dcm       # 真实标签（无残影）
+│       │   ├── ghosted.dcm     # 带残影的图像
+│       │   └── previous.dcm    # 产生残影的上一张图像
 │       └── ...
 ├── processed/
-│   ├── physics_cleaned/        # Phase 1 outputs
-│   └── synthetic_pairs/        # Generated synthetic training data
+│   ├── physics_cleaned/        # 阶段 1 输出
+│   └── synthetic_pairs/        # 生成的合成训练数据对
 
 src/
 ├── data/
-│   ├── dataset.py              # DICOM loading, normalization, patching
-│   └── synthetic.py            # Synthetic ghost pair generation
+│   ├── dataset.py              # DICOM 加载、归一化、patch 切分
+│   └── synthetic.py            # 合成残影图像对生成
 ├── models/
-│   ├── physics_model.py        # Coefficient estimation + subtraction
-│   └── unet_ghost.py           # U-Net architecture
+│   ├── physics_model.py        # 系数估计 + 残影相减
+│   └── unet_ghost.py           # U-Net 网络结构
 ├── training/
-│   └── trainer.py              # Training loop
+│   └── trainer.py              # 训练循环
 ├── evaluation/
-│   └── metrics.py              # PSNR, SSIM evaluation
+│   └── metrics.py              # PSNR、SSIM 评估
 └── utils/
-    └── dicom_utils.py          # DICOM I/O preserving headers
+    └── dicom_utils.py          # 在保留头信息的情况下进行 DICOM I/O
 
 configs/
 ├── data/
-│   └── default.yaml            # Normalization, patch size, augmentation
+│   └── default.yaml            # 归一化、patch 大小、数据增强
 ├── model/
-│   └── unet.yaml               # Architecture hyperparameters
+│   └── unet.yaml               # 网络结构超参数
 └── train/
-    └── default.yaml            # LR, epochs, batch size, loss weights
+    └── default.yaml            # 学习率、epoch、batch size、损失权重
 
 scripts/
-├── run_physics_baseline.py     # Run Phase 1 on all images
-├── generate_synthetic.py       # Generate synthetic training pairs
-├── train.py                    # Train U-Net
-└── evaluate.py                 # Evaluate on test pairs
+├── run_physics_baseline.py     # 在全部图像上运行阶段 1
+├── generate_synthetic.py       # 生成合成训练图像对
+├── train.py                    # 训练 U-Net
+└── evaluate.py                 # 在测试图像对上评估
 ```
 
 ---
 
-## Implementation Plan
+## 实现计划
 
-### Step 1: DICOM Utilities + Data Loading (~2 days)
-- `src/utils/dicom_utils.py`: Load/save DICOM preserving headers, normalize to float32
-- `src/data/dataset.py`: PyTorch Dataset for sequential images and paired data
-- Config files for data parameters
+### 步骤 1：DICOM 工具 + 数据加载（约 2 天）
+- `src/utils/dicom_utils.py`：加载/保存 DICOM 并保留头信息，将数据归一化为 float32
+- `src/data/dataset.py`：用于连续图像和配对数据的 PyTorch Dataset
+- 数据参数配置文件
 
-### Step 2: Physics-Based Baseline (~3 days)
-- `src/models/physics_model.py`: Background detection, coefficient estimation, ghost subtraction
-- `scripts/run_physics_baseline.py`: Process all 30 images, save to `data/processed/physics_cleaned/`
-- Visual comparison of before/after
+### 步骤 2：基于物理的基线方法（约 3 天）
+- `src/models/physics_model.py`：背景检测、系数估计、残影相减
+- `scripts/run_physics_baseline.py`：处理全部 30 张图像，并保存到 `data/processed/physics_cleaned/`
+- 对处理前后结果进行视觉对比
 
-### Step 3: Synthetic Data Generation (~2 days)
-- `src/data/synthetic.py`: Generate ghosted images by blending clean images with ghost fractions
-- `scripts/generate_synthetic.py`: Produce ~5,000 synthetic pairs
-- Use Phase 1 estimated coefficients to set realistic ghost intensities
+### 步骤 3：合成数据生成（约 2 天）
+- `src/data/synthetic.py`：按照残影比例将干净图像进行混合，生成带残影图像
+- `scripts/generate_synthetic.py`：生成约 5,000 对合成数据
+- 使用阶段 1 估计得到的系数设置合理的残影强度
 
-### Step 4: U-Net Architecture + Training (~5 days)
-- `src/models/unet_ghost.py`: U-Net with 3-channel input, 1-channel output
-- `src/training/trainer.py`: Training with L1 + SSIM + perceptual loss
-- `scripts/train.py`: Main training script with config-driven hyperparameters
-- Train on synthetic data first
+### 步骤 4：U-Net 网络结构 + 训练（约 5 天）
+- `src/models/unet_ghost.py`：3 通道输入、1 通道输出的 U-Net
+- `src/training/trainer.py`：使用 L1 + SSIM + 感知损失进行训练
+- `scripts/train.py`：由配置文件驱动的主训练脚本
+- 首先在合成数据上训练
 
-### Step 5: Evaluation (~3 days)
-- `src/evaluation/metrics.py`: PSNR, SSIM computation
-- `scripts/evaluate.py`: Evaluate physics baseline and U-Net on held-out pairs
-- Generate comparison figures
+### 步骤 5：评估（约 3 天）
+- `src/evaluation/metrics.py`：计算 PSNR、SSIM
+- `scripts/evaluate.py`：在留出的测试数据上评估基于物理的基线方法和 U-Net
+- 生成对比图
 
-### Step 6: Fine-tuning with Real Paired Data (after acquisition)
-- Fine-tune U-Net on real paired data
-- Compare against synthetic-only model
+### 步骤 6：使用真实配对数据微调（完成数据采集后）
+- 在真实配对数据上微调 U-Net
+- 与仅使用合成数据训练的模型进行比较
 
 ---
 
-## Key Decisions
+## 关键决策
 
-- **Input channels**: Provide previous images explicitly rather than asking the model to learn ghost patterns blindly. This is more data-efficient.
-- **Patch-based training**: Full 3048x2548 images are too large for GPU memory. Train on 512x512 patches with overlap, stitch at inference.
-- **16-bit preservation**: Normalize to [0,1] float for training but output back to original 16-bit range in DICOM.
-- **No ghost detection/scoring**: Scope is removal only. Detection can be added later.
+- **输入通道**：显式提供前序图像，而不是要求模型盲目学习残影模式。这样能够提高数据效率。
+- **基于 patch 的训练**：完整的 3048x2548 图像对于 GPU 显存来说过大。训练时使用带重叠的 512x512 patch，推理时再进行拼接。
+- **保留 16-bit**：训练时归一化到 [0,1] 的浮点数范围，但最终输出 DICOM 时恢复到原始 16-bit 范围。
+- **不做残影检测/评分**：当前范围仅包含残影去除。检测功能可在后续加入。

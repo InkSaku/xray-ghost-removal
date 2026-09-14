@@ -8,8 +8,7 @@ matplotlib>=3.7.0
 # Install the CUDA build for GPU training, see scripts/setup_remote.sh.
 torch>=2.0.0
 
-# Optional. For reading data/raw/AI修残影例图/拍摄参数记录.xlsx.
-# No script imports it yet, that dataset is unprocessed.
+# Dark/light analysis. Reads data/raw/AI修残影例图/拍摄参数记录.xlsx.
 openpyxl>=3.1.0
 
 # Tests

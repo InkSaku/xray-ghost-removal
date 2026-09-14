@@ -1,132 +1,133 @@
-# Results
+# 结果
 
-What is established, what is not, and where the numbers come from. Every figure below was
-regenerated on 2026-09-12 from the 30-frame sequence in `data/raw/残影图像/`. Where a number
-disagrees with an older document, that is called out rather than quietly reconciled.
+本文件说明哪些结论已经确定、哪些尚未确定，以及各项数字的来源。第 1 至第 3 节记录 2026-09-12 使用 `data/raw/残影图像/` 中 30 帧序列复测的结果；第 4 节记录 2026-09-14 对 62 张 dark/light 图像完成的阶段 0–2 稳健性分析。当新结果与旧文档或初步分析不一致时，这里会明确记录差异。
 
 ---
 
-## 1. The linear superposition model holds, but only after spatial averaging
+## 1. 线性叠加模型成立，但只有在进行空间平均后才明显
 
-Reproduce with `python scripts/analyze_linear_fit.py`.
+复现实验：`python scripts/analyze_linear_fit.py`。
 
-| Quantity | Value |
+| 指标 | 数值 |
 |---|---|
-| Consecutive frame pairs analysed | 29 of 30 frames |
-| Pairs with a physically plausible positive coefficient, 0.001 to 0.02 | 11 of 29 |
-| Background pixels per regression, median | 6.46 million at full resolution |
-| Coupling coefficient alpha, median | 0.0040, interquartile range 0.0026 to 0.0111 |
-| Per-pixel R squared, median | 0.013 |
-| Block-averaged R squared, median | 0.010, maximum 0.584 |
-| Strongest frame, image 4 | alpha 0.0095, block R squared 0.584 |
-| Per-pixel noise sigma, image 4 | about 239 at 16-bit |
+| 分析的连续图像对数量 | 30 帧中的 29 对 |
+| 具有物理上合理正系数（0.001 到 0.02）的图像对 | 29 对中的 11 对 |
+| 每次回归使用的背景像素数，中位数 | 全分辨率下 646 万 |
+| 耦合系数 alpha，中位数 | 0.0040，四分位距 0.0026 到 0.0111 |
+| 逐像素 R²，中位数 | 0.013 |
+| 分块平均后的 R²，中位数 | 0.010，最大值 0.584 |
+| 最强残影帧，第 4 张图 | alpha 0.0095，分块 R² 0.584 |
+| 第 4 张图的逐像素噪声 sigma | 16-bit 下约为 239 |
 
-The reading is straightforward. Pixel by pixel the fit explains almost nothing, with R squared
-near 0.013, because a ghost carrying under 1% of the previous image sits below a per-pixel
-noise sigma of roughly 239. Average over 16 by 16 blocks and the strongest frame reaches R
-squared 0.584, which is what confirms the ghost is a coherent scaled copy of the previous frame
-rather than noise. The model is real. The per-pixel signal to noise ratio is the obstacle.
+结论很直接。逐像素来看，拟合几乎无法解释数据，R² 只有约 0.013，因为一个只携带上一帧不到 1% 信号的残影，其强度低于约 239 的逐像素噪声 sigma。然而，当使用 16×16 分块进行平均后，残影最强的第 4 张图可以达到 R²=0.584，这说明残影确实是上一帧图像的一个相干缩放副本，而不是随机噪声。模型本身是真实存在的，障碍在于逐像素信噪比过低。
 
-Only 11 of 29 pairs show a usable ghost at all. In the rest the ghost is either absent or
-buried, and the fitted coefficient falls outside the plausible range. Any claim about method
-performance that averages over all 30 frames is therefore averaging mostly over frames with no
-measurable ghost.
+29 对图像中只有 11 对存在可用的残影信号。在其他图像对中，残影要么不存在，要么已经被噪声淹没，拟合得到的系数会落在合理范围之外。因此，如果把方法性能在全部 30 帧上做平均，实际上主要是在对大量“没有可测残影”的图像求平均。
 
-**Discrepancy to be aware of.** `docs/plans/2026-05-28-real-data-acquisition-protocol.md`
-quotes alpha of about 0.0085 for a clean case. The median over the 11 valid pairs measured here
-is 0.0040, and image 4 specifically gives 0.0095. The older figure is consistent with the
-strong frames but not with the sequence median, so treat 0.0085 as a best-case value.
+**需要注意的差异。** `docs/plans/2026-05-28-real-data-acquisition-protocol.md` 中给出的干净样例 alpha 约为 0.0085。这里对 11 个有效图像对重新测得的中位数为 0.0040，而第 4 张图本身为 0.0095。旧数字与残影较强的帧是一致的，但并不代表整个序列的中位水平，因此应把 0.0085 看作最佳情况而不是典型情况。
 
-**Small bug worth fixing.** `scripts/analyze_linear_fit.py` prints its block-averaged statistic
-as `空间分块(32px)` while `fit_pair` uses `blk=16` by default. The label says 32 pixels and the
-computation uses 16. The numbers above are for 16-pixel blocks.
+**一个值得修复的小错误。** `scripts/analyze_linear_fit.py` 输出的分块平均统计标签是 `空间分块(32px)`，但 `fit_pair` 默认使用 `blk=16`。也就是说，标签写的是 32 像素，实际计算使用的是 16 像素。上述数字均对应 16 像素分块。
 
 ---
 
-## 2. What the removers actually do
+## 2. 各种去除器实际上做了什么
 
-Reproduce with `python scripts/run_ghost_removal.py --indices 4,6,18`.
+复现实验：`python scripts/run_ghost_removal.py --indices 4,6,18`。
 
-Note that despite its name and despite how it is described in the acquisition protocol
-document, `run_ghost_removal.py` calls `remove_ghost_iterative` from `seamless_ghost.py`, not
-the confidence-gated linear remover in `linear_ghost.py`. The gated linear remover is currently
-reached only by `generate_proposal_figures.py`, and there with `r2_threshold=0.0`, which
-disables the gate. This matters because the safety argument for the project, namely that a
-low-confidence image is left untouched, applies to the linear remover and not to the script
-that is normally run.
+需要注意的是，尽管脚本名字如此，并且数据采集协议中也把它描述成带置信度门控的线性去除器，但 `run_ghost_removal.py` 实际调用的是 `seamless_ghost.py` 中的 `remove_ghost_iterative`，而不是 `linear_ghost.py` 中带置信度门控的线性去除器。当前只有 `generate_proposal_figures.py` 会调用带门控的线性去除器，而且在该脚本中设置了 `r2_threshold=0.0`，这实际上关闭了门控。这一点非常重要，因为项目中的安全性论据——即低置信度图像保持不变——只适用于线性去除器，并不适用于通常实际运行的主脚本。
 
-Measured coherent-ghost suppression in the ghost zone, defined as the reduction in the standard
-deviation of 16-pixel block means over the region that is air in the current frame and object in
-the previous frame.
+下面测量的是残影区域中的“相干残影抑制率”。该指标定义为：在当前图像为空气区域、而上一张图像为物体区域的位置上，比较 16 像素分块均值的标准差在处理前后的下降比例。
 
-| Image | Ghost zone, share of frame | Block std before | Block std after | Suppression |
+| 图像 | 残影区域，占整幅图比例 | 处理前分块标准差 | 处理后分块标准差 | 抑制率 |
 |---|---|---|---|---|
 | 4 | 6.4% | 256.1 | 152.3 | 40.5% |
 | 6 | 9.3% | 2925.1 | 2813.9 | 3.8% |
 | 18 | 1.6% | 983.3 | 1384.0 | -40.8% |
 
-All three were reported as applied by the script. On image 4, the reference case, the
-correction clearly helps. On image 6 it does almost nothing. On image 18 this metric gets worse
-after the correction.
+脚本对这三张图都报告为已经执行处理。对于第 4 张参考图，修正明显有效；对于第 6 张图，几乎没有效果；对于第 18 张图，处理后该指标反而变差。
 
-Two caveats before reading too much into that table. The ghost zone also contains real anatomy
-from the current exposure, so block variance there is not a pure ghost measurement, and the
-seamless method deliberately rewrites the low-frequency component, which this metric penalises.
-The negative value on image 18 is therefore not proof of damage. What it does show is that
-there is no metric available today that cleanly separates a good correction from a bad one.
+在对这张表进行过度解读之前，需要注意两点。第一，所谓残影区域中也可能包含当前曝光产生的真实解剖结构，因此该区域的分块方差并不是纯粹的残影测量。第二，seamless 方法会有意重写低频成分，而该指标恰好会惩罚这种操作。因此，第 18 张图出现负值并不能证明图像被破坏。它真正说明的是：当前还不存在一个能够可靠地区分“修得好”和“修得坏”的指标。
 
-**Discrepancy to be aware of.** Both design documents state a 97% reduction on image 4. That
-number was produced by a different suppression definition than the one above, and the run in
-this session did not reproduce it under the block-variance metric, which gives 40.5%. Neither
-number is validated against ground truth. Do not quote 97% without re-deriving it.
+**需要注意的差异。** 两份设计文档都声称第 4 张图的残影减少了 97%。这个数字使用了与上表不同的抑制定量方式，而本次重新运行无法在分块方差指标下复现该值；使用当前指标得到的是 40.5%。两个数字都没有通过真实标签验证，因此在没有重新推导的情况下，不要引用 97%。
 
 ---
 
-## 3. The U-Net does not transfer
+## 3. U-Net 无法迁移到真实数据
 
-The U-Net in `src/models/unet.py` trains on synthetic pairs from `src/data/synthetic.py`, where
-a ghost is planted with a known coefficient, and it learns to predict the planted ghost.
-`scripts/diagnose_model.py` exists to separate the two ways this can fail, specifically a
-training failure, where the model cannot remove even the synthetic ghosts it was trained on,
-against a transfer failure, where it handles synthetic ghosts and fails on real ones.
+`src/models/unet.py` 中的 U-Net 使用 `src/data/synthetic.py` 生成的合成图像对进行训练，其中人为植入一个已知系数的残影，网络学习预测该人为植入的残影。`scripts/diagnose_model.py` 的作用是区分两种不同的失败情况：第一种是训练失败，即模型连训练时见过的合成残影都无法去除；第二种是迁移失败，即模型能够处理合成残影，却无法处理真实残影。
 
-The recorded outcome is a transfer failure. The synthetic ghost model does not match the real
-plate physics closely enough. `data/processed/unet_cleaned/` and `results/figures/unet/` are
-empty and no checkpoint was kept, so there is no trained model to inherit.
+已记录的结果属于第二种，也就是迁移失败。合成残影模型与真实成像板的物理机制不够匹配。`data/processed/unet_cleaned/` 和 `results/figures/unet/` 都是空的，并且没有保留任何 checkpoint，因此没有已经训练好的模型可以直接继承使用。
 
-This is not a reason to rework the architecture. It is the same conclusion the other three
-methods reached, namely that the missing ingredient is real supervision rather than a better
-estimator.
+这并不意味着应该优先重新设计网络结构。其他三种方法也得出了同样的结论：真正缺失的是来自真实数据的监督信息，而不是一个更复杂的估计器。
 
 ---
 
-## 4. The one thing that unblocks everything
+## 4. dark/light 数据支持 H2 和多帧记忆，但不能作为 clean reference
 
-Every method here estimates alpha from the image itself and then has no way to check the
-estimate. Strong clean ghosts can be verified by eye. Weak ghosts cannot, so every estimator
-either under-corrects or over-corrects and no tuning resolves it.
+复现实验：
 
-Paired acquisition removes the ambiguity. With a clean image, a previous image, and a ghosted
-image of the same object, the true ghost is exactly `ghosted - clean` and the true coefficient
-follows directly. That makes PSNR and SSIM meaningful, replaces the R squared confidence
-heuristic with a measured prior, and gives the U-Net real targets.
+```bash
+python scripts/analyze_dark_light_pairs.py
+```
 
-Ten pairs varying only the exposure of the ghost source are enough to confirm the linear model
-on real data and produce an alpha against dose curve. The full protocol is in
-`docs/plans/2026-05-28-real-data-acquisition-protocol.md`. This needs scanner time, not code.
+输入为 `data/raw/AI修残影例图/` 下的 62 张 DICOM 和 `拍摄参数记录.xlsx`。本次曝光记录文件的 SHA-256 为 `fcc5007eede094dce3cf659d9db5246d26016638465e8cb8e8e052214cc81a9a`。默认输出为 `outputs/dark_light_analysis_20260913/robustness_results.json`；脚本不生成逐对图片或 CSV。`dark_light_afterglow_analysis.xlsx` 是基于同一 JSON 整理的人工查看副本，机器可读 JSON 是事实来源。输出目录名沿用首次分析日期，准确运行时间应读取 JSON 的 `generated_at`，不能从目录名推断。
+
+### 4.1 阶段 0：证据边界
+
+- 31 个编号均按照 `dark_N` 后接 `light_N` 的顺序记录，因此主要因果候选是 `light_(N-1) → dark_N`，共 30 组。
+- 拍摄记录表中的“时间”是 light 的曝光时长（ms），不是拍摄时刻。
+- 62 张 DICOM 均没有 `AcquisitionTime`。
+- `InstanceCreationTime` 只保留在审计字段中，未参与任何拟合、对照、标签或物理解释。
+- 分析不做图像配准，使用原始探测器坐标。
+
+因此，本次分析只能讨论记录顺序下的空间相关，不能推算真实帧间隔、余辉半衰期或时间衰减常数。
+
+### 4.2 阶段 1：单阶 H2 稳健性
+
+每个 `light_(N-1) → dark_N` 候选对同时测试 4 种分块大小（8、16、32、64）、3 种 dark 基线和 2 种饱和掩膜，共 24 个设置。空模型由因果上不可能的未来 light、空间平移和 block shuffle 构成。单个设置只有同时满足以下条件才算通过：`0 < alpha <= 0.02`、空间交叉验证 R² 高于空间空模型的第 95 百分位、真实前序 light 在未来 light 对照中排名第一。pair 级别还要求通过率至少 75%、正 alpha 比例至少 90%、正交叉验证 R² 比例至少 75%。
+
+| 结果 | 数量 | 编号 |
+|---|---:|---|
+| 稳健确认 | 5 | `5→6`、`11→12`、`19→20`、`27→28`、`28→29` |
+| 参数敏感 | 21 | 其余未列入“稳健确认”或“未检出”的 pair |
+| 未检出 | 4 | `4→5`、`6→7`、`26→27`、`30→31` |
+
+30 组的中位通过率为 0.50，中位 alpha 为 0.000855，中位交叉验证 R² 为 0.2943；空间空模型的中位交叉验证 R² 为 0.00398。这证明 H2 在部分样本中显著存在，但其强度并不在全部条件下稳定。尤其是，“未检出”只表示当前检验没有发现稳健信号，不等价于该 dark 图像已经被证明无残影。
+
+### 4.3 阶段 2：多阶记忆
+
+多阶分析使用 lag 1–5 的非负最小二乘、四折空间交叉验证、只打乱旧 lag 且保留 lag 1 的置换对照，以及 100 次空间 tile bootstrap。30 张可分析 dark 中有 17 张支持多帧记忆：`11–22`、`25`、`27`、`29–31`。完整多阶模型相对仅使用 lag 1 的模型，其中位交叉验证 R² 增益为 0.01347。
+
+设计矩阵条件数的中位数为 3.06，最大值为 5.86，未显示严重的整体数值病态；但多阶拟合为了保持共同空间域而使用观测 DICOM 值。当 light 图像发生截断饱和时，各 lag 系数仍可能有偏，因此当前系数不能直接写入合成数据生成器。
+
+### 4.4 当前可引用结论
+
+1. `light_(N-1) → dark_N` 是有证据支持的主要候选关系，但只有 5/30 组达到当前严格稳健标准。
+2. 17/30 张 dark 支持超出单一前帧的序列记忆。
+3. 这批 dark 图像是校准/诊断目标，不是 exposed light 图像的 clean reference；目前不能从中构造可靠监督标签。
+4. 由于缺少 `AcquisitionTime`，任何时间衰减结论都尚未测量。
+
+**与初步分析的差异。** 先前只依赖单一设置得到的 `17/5/8` 分类没有覆盖基线、饱和掩膜、分块大小和因果空模型的稳健性检查，现已由 `5 个稳健确认 / 21 个参数敏感 / 4 个未检出` 替代。后续引用应使用本节数字。
 
 ---
 
-## 5. Open items
+## 5. 真实 ground truth 仍是解除定量验证瓶颈的条件
 
-- The dark/light dataset in `data/raw/AI修残影例图/`, 62 images acquired in July 2026, has no
-  processing script. Whether the dark frame can serve as a ghost-free reference for its light
-  partner has not been tested, and that test is cheap.
-- No metric cleanly separates a good correction from a bad one without ground truth. The
-  block-variance suppression used in section 2 is a stopgap.
-- `run_ghost_removal.py` is named and documented as the gated remover but runs the seamless one,
-  as described in section 2.
-- The block size label in `analyze_linear_fit.py` does not match the code, as described in
-  section 1.
-- Removal parameters, specifically `alpha_cap`, `r2_threshold`, `min_air_fraction`, and the
-  diffusion settings, were set by hand and never swept.
+这里的每种方法都会从图像本身估计 alpha，但估计出来以后却没有办法验证该估计值。强而清晰的残影可以通过肉眼判断；弱残影则无法判断，因此所有估计器都会在“校正不足”和“校正过度”之间摇摆，而继续调参并不能解决这个根本问题。
+
+配对采集可以消除这种歧义。如果有同一物体的干净图像、上一张图像和带残影图像，那么真实残影就精确等于 `ghosted - clean`，真实系数也可以直接求得。这样一来，PSNR 和 SSIM 才真正有意义，R² 置信度启发式可以被实测先验替代，同时 U-Net 也能够获得真实训练目标。
+
+只需要 10 组配对数据，并且只改变残影源的曝光量，就足以在真实数据上确认线性模型并得到 alpha 与剂量之间的关系曲线。完整采集流程见 `docs/plans/2026-05-28-real-data-acquisition-protocol.md`。这一步需要的是扫描仪使用时间，而不是更多代码。
+
+---
+
+## 6. 待处理事项
+
+- 在阶段 0–2 的稳健性分析之后，下一步是只使用 kV、mA、曝光时长和 mAs 做曝光关联；不得使用 `InstanceCreationTime` 补造时间轴。
+- 如果需要测量真实时间衰减，必须补采并记录设备侧可靠时间间隔或外部计时结果；当前 62 张图像不具备这个条件。
+- 仍需采集同一物体、固定几何条件下的 `clean / previous / ghosted` 三元组，才能验证 clean reference、PSNR/SSIM 和真实 alpha。
+- 多阶拟合在 light 截断饱和时可能产生偏差；在把 lag 系数用于合成数据之前，需要单独完成饱和敏感性验证。
+- 当前 JSON 记录曝光工作簿哈希和逐图审计统计，但没有记录 62 个 DICOM 的内容哈希；更换同名影像后必须重新运行，不能假设结果仍对应同一数据版本。
+- 在没有真实标签的情况下，目前不存在一个能够可靠区分“好的修正”和“坏的修正”的指标。第 2 节使用的分块方差抑制率只是临时替代方案。
+- `run_ghost_removal.py` 的名称和文档把它描述成带门控的去除器，但实际上它运行的是 seamless 方法，详见第 2 节。
+- `analyze_linear_fit.py` 中的分块大小标签与实际代码不一致，详见第 1 节。
+- 去除参数，尤其是 `alpha_cap`、`r2_threshold`、`min_air_fraction` 和扩散相关设置，都是人工设定的，从未进行系统参数扫描。

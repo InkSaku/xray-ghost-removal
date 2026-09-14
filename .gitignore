@@ -3,6 +3,7 @@ data/
 *.dcm
 
 # Outputs
+outputs/
 results/
 figures/
 experiments/
