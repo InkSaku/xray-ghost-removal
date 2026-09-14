@@ -108,6 +108,49 @@ python scripts/analyze_dark_light_pairs.py
 
 **与初步分析的差异。** 先前只依赖单一设置得到的 `17/5/8` 分类没有覆盖基线、饱和掩膜、分块大小和因果空模型的稳健性检查，现已由 `5 个稳健确认 / 21 个参数敏感 / 4 个未检出` 替代。后续引用应使用本节数字。
 
+### 4.5 第一轮 pseudo-ghost 机制实验
+
+复现实验：
+
+```bash
+python scripts/analyze_pseudo_ghost_mechanism.py
+```
+
+本实验不采用 `dark ≈ ghost`。分析目标统一定义为：
+
+```text
+X_(t-1) = L_(t-1) - Q75(L_(t-1))
+Y_t     = D_t - median(D_t) - B_(-t)
+Y_t     = alpha * X_(t-1) + intercept + error
+```
+
+`B_(-t)` 是由除目标 dark 外的全部 median-centered dark 构成的逐位置中位数。`Y_t` 是 pseudo ghost / 可观测残影信号，仍包含 read noise、baseline 误差、漂移和潜在旧帧记忆，不能当作真实标签。
+
+第一轮只运行未明显饱和且不支持多帧记忆的两组机制探索样本。每个 fold 的 trimming 阈值和 affine 参数只由另外三个空间 fold 估计；held-out `Y` 不参与自身的筛选、拟合或参数选择。下表为 `all` mask 的严格 OOF 结果：
+
+| 配对 | block | OOF CV-R² | NCC | alpha（四折均值） | alpha 折间 CV | residual variance ratio | null R² P95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `5→6` | 8 | 0.428 | 0.655 | 0.000536 | 3.8% | 0.572 | 0.124 |
+| `5→6` | 16 | 0.432 | 0.658 | 0.000531 | 3.9% | 0.568 | 0.123 |
+| `5→6` | 32 | 0.421 | 0.650 | 0.000521 | 4.0% | 0.579 | 0.127 |
+| `5→6` | 64 | 0.400 | 0.633 | 0.000504 | 3.7% | 0.600 | 0.137 |
+| `27→28` | 8 | 0.778 | 0.882 | 0.000773 | 1.9% | 0.222 | 0.078 |
+| `27→28` | 16 | 0.778 | 0.882 | 0.000774 | 1.9% | 0.222 | 0.080 |
+| `27→28` | 32 | 0.773 | 0.879 | 0.000770 | 2.0% | 0.227 | 0.081 |
+| `27→28` | 64 | 0.764 | 0.874 | 0.000760 | 1.8% | 0.236 | 0.082 |
+
+两组在四个尺度上均超过由 future light、空间平移和 block shuffle 构成的 null P95，且由于源 light 几乎没有顶格像素，开关饱和掩膜不会改变真实配对结果。这说明前序 light 的空间结构确实存在于后续 dark 的可观测信号中，单帧 affine 模型是一个有效的一阶描述。
+
+但这不是“模型已经解释完 ghost”的证据。16×16 residual 的相邻块相关系数在两组中分别为 0.970 和 0.975，六联图中也能看到大尺度稳定结构。与此同时，低频 residual 与当前 source 的相关分别约为 0.000 和 -0.035，说明主要 source-aligned 成分已被移除，但剩余结构不能归类为随机噪声。它可能来自 baseline 构造、固定模式、漂移或更老帧；下一步应先做 baseline/旧帧归因，再测试 blur 或空间变化 alpha。
+
+结果文件为 `outputs/pseudo_ghost_mechanism_v1/analysis_results.json`，六联图和 16×16 OOF 数组位于相应 pair 子目录。`outputs/` 继续保持不提交。
+
+### 4.6 LOO median baseline 污染审计
+
+2026-09-14 使用一次性临时代码在 16×16 block-mean 域完成审计；项目中没有保留审计脚本、图片或新增机器结果文件。31 张 median-centered dark 的统一色标 contact sheet 显示，显著物体结构会随前序曝光改变，并非固定存在于相同位置。100 次固定种子随机拆半所得 baseline 的全图相关中位数为 0.877、归一化差异中位数为 0.525；中央 50% 区域分别为 0.715 和 0.792。early/late baseline 在中央区域的相关仅为 0.337，归一化差异为 1.171，并且差值图包含清楚的曝光物体轮廓。因此，这批数据的 LOO median baseline 明显受采样内容和序列阶段影响，不能解释为可靠的 detector background；由它产生的 pseudo-ghost 幅值和 residual 结构都具有 baseline 依赖性。
+
+但 M1 的定性结论没有翻转。对 `5→6` 和 `27→28` 分别使用 `loo_median`、`low_activity` 和 `intercept_only` 后，六种设置均得到正 alpha、真实前序 light 均超过 null R² P95，且在 future-light 对照中均排名第一。`5→6` 的 OOF CV-R² 范围为 0.432–0.976、alpha 范围为 0.000531–0.000985；`27→28` 分别为 0.754–0.903 和 0.000774–0.001003。因此可以保留“前序曝光信号进入后续 dark”的结论，但不能把当前 LOO 结果用于精确解释 alpha、残影能量或 residual 组成；在获得独立 calibration dark 或建立经验证的背景估计前，暂停基于该 residual 推进 blur、multi-lag 和空间变化 alpha。
+
 ---
 
 ## 5. 真实 ground truth 仍是解除定量验证瓶颈的条件

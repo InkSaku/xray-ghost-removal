@@ -9,6 +9,8 @@
 
 62 张 dark/light 图像的前三阶段稳健性分析已经完成。拍摄顺序支持把 `light_(N-1) → dark_N` 作为因果候选配对，但 30 组中只有 5 组在 24 种分析设置下得到稳健确认，21 组对基线、饱和掩膜或分块大小敏感，4 组未检出；另有 17/30 张 dark 图像支持多帧记忆效应。因此，这批 dark 图像不能整批作为 clean reference，也不能把“未检出”直接解释为“无残影”。
 
+第一轮 pseudo-ghost 机制实验也已完成。实验不使用 `dark ≈ ghost` 的简化，而是定义 `Y_t = D_t - median(D_t) - B_(-t)`，并对 `5→6`、`27→28` 生成严格四折空间 OOF 预测。16×16 分块下两组 OOF CV-R² 分别为 0.432 和 0.778，且在 8/16/32/64 四种尺度上均超过对应 null P95；不过 residual 仍有很强的空间结构，因此当前只能确认单帧 affine 模型解释了前序图像相关成分，不能声称剩余部分是随机噪声。
+
 全部 62 张 DICOM 均缺少 `AcquisitionTime`。`InstanceCreationTime` 只用于审计，未进入配对、拟合、标签或物理解释，所以当前结果不能估计余辉半衰期或真实时间衰减。当前最高价值的代码工作是只基于已记录的 kV、mA、曝光时长和 mAs 做曝光关联分析；最终定量验证和监督训练仍需要按采集协议获得真实 `clean / previous / ghosted` 三元组。引用数字前请先阅读 `RESULTS.md`。
 
 ---
@@ -36,6 +38,7 @@ I_t(x) = S_t(x) + sum_k alpha_k * (I_{t-k}(x) - bg_{t-k})
 | `src/data/synthetic.py` | 生成合成的（带残影、干净、上一帧、残影）图像对 | 可以工作，但合成残影模型与真实情况并不匹配 |
 | `src/utils/dicom_utils.py` | 在保留头信息的情况下加载和保存 DICOM | 可运行 |
 | `scripts/analyze_dark_light_pairs.py` | 对 62 张 dark/light 图像执行证据边界、单阶稳健性和多阶记忆分析 | 已实现并完成一次全量运行；默认只写一个机器可读 JSON，不生成逐对图片或 CSV |
+| `scripts/analyze_pseudo_ghost_mechanism.py` | 对可观测残影信号生成严格空间 OOF 预测、null 对照和六联图 | 已对 `5→6`、`27→28` 完成第一轮运行；不把 dark 当作 clean ground truth |
 
 ---
 
@@ -66,7 +69,7 @@ python -m pip install -r requirements.txt
 
 **推荐使用 Python 3.12。** 这是当前实际验证 dark/light 分析与 smoke test 的版本；不要把旧记录中对 Python 3.13/3.14 或 PyTorch wheel 可用性的描述视为当前保证。三个传统去除器和分析流程主要依赖 NumPy、SciPy、pydicom、openpyxl 与 matplotlib；U-Net 路线另外需要与运行平台匹配的 PyTorch。如果要在远程机器上使用 GPU 训练，`scripts/setup_remote.sh` 会基于 Python 3.12 和 CUDA 12.4 wheel 创建 conda 环境。
 
-已于 2026-09-14 在 Python 3.12.7 上验证 dark/light 分析脚本可以完整运行。当前 smoke test 结果为 8 项通过、1 项失败：`test_unet_forward_shape` 预期张量，但 `GhostUNet.forward()` 当前返回 tuple。这个接口不一致不影响本次 NumPy/SciPy 分析，但意味着测试套件目前不是全绿状态。
+已于 2026-09-14 在 Python 3.12.7 上验证 dark/light 与 pseudo-ghost 分析脚本可以完整运行。当前本机测试结果为 10 项通过、1 项跳过；跳过项是因为本机没有安装可导入的 PyTorch，不影响本次 NumPy/SciPy 分析。
 
 在处理数据之前，先验证安装是否正确。
 
@@ -96,6 +99,10 @@ python scripts/analyze_linear_fit.py
 # 不使用 InstanceCreationTime，不生成逐对图片或 CSV。
 python scripts/analyze_dark_light_pairs.py
 
+# 第一轮 pseudo-ghost 机制实验。默认运行 5→6 和 27→28，输出严格
+# 空间 OOF 六联图、四尺度指标、null 对照和可复查的 OOF 数组。
+python scripts/analyze_pseudo_ghost_mechanism.py
+
 # 在整个序列上运行基于扩散修补的基线方法。
 python scripts/run_physics_baseline.py --n-previous 5
 
@@ -121,7 +128,8 @@ python scripts/diagnose_model.py --device cuda
    第 4 张图具有最强且最干净的残影，是参考样例。预期可以看到明显改善；按照当前指标，其相干残影抑制率约为 40%。旧文档使用不同指标时曾给出该图 97% 的数字，在引用其中任意一个数字之前，请先阅读 `RESULTS.md` 第 2 节。
 3. 阅读 `RESULTS.md`，了解哪些结论已经确定，哪些仍未确定。
 4. 如本地存在 62 张 dark/light 数据，运行 `python scripts/analyze_dark_light_pairs.py`，并对照 `RESULTS.md` 第 4 节核对 5/21/4 和 17/30 的汇总结果。
-5. 下一步先做不依赖时间字段的曝光参数关联，再阅读 `docs/plans/2026-05-28-real-data-acquisition-protocol.md` 准备真实三元组采集。后者需要扫描仪使用时间。
+5. 运行 `python scripts/analyze_pseudo_ghost_mechanism.py`，查看 `5→6` 和 `27→28` 的严格 OOF 六联图。下一步先区分 residual 中的 baseline 误差与旧帧结构，再冻结模型并回到全部 30 组验证。
+6. 阅读 `docs/plans/2026-05-28-real-data-acquisition-protocol.md`，准备真实三元组采集。后者需要扫描仪使用时间，仍是验证实际去除质量的必要条件。
 
 ---
 
