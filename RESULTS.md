@@ -151,6 +151,35 @@ Y_t     = alpha * X_(t-1) + intercept + error
 
 但 M1 的定性结论没有翻转。对 `5→6` 和 `27→28` 分别使用 `loo_median`、`low_activity` 和 `intercept_only` 后，六种设置均得到正 alpha、真实前序 light 均超过 null R² P95，且在 future-light 对照中均排名第一。`5→6` 的 OOF CV-R² 范围为 0.432–0.976、alpha 范围为 0.000531–0.000985；`27→28` 分别为 0.754–0.903 和 0.000774–0.001003。因此可以保留“前序曝光信号进入后续 dark”的结论，但不能把当前 LOO 结果用于精确解释 alpha、残影能量或 residual 组成；在获得独立 calibration dark 或建立经验证的背景估计前，暂停基于该 residual 推进 blur、multi-lag 和空间变化 alpha。
 
+### 4.7 污染感知的混合背景
+
+2026-09-16 在原 `hybrid_spline` 上进一步替换了固定图样 `F`。新方法对每张非目标 dark 先排除其紧邻前一张 light 的扩张物体支持区，拟合并去除该帧的平滑场，再用噪声精度加权的 Huber 均值合并剩余高频结构。目标 dark 不参与 `F` 估计，`F` 也不再使用逐位置时间中位数。当前 dark 的平滑漂移仍仅在前序物体区外拟合。脚本中该模式名为 `masked_hybrid_spline`。
+
+复现本节比较：
+
+```bash
+python scripts/analyze_pseudo_ghost_mechanism.py \
+  --pairs single-lag --summary-only \
+  --background-modes loo_median,hybrid_spline,masked_hybrid_spline \
+  --primary-background masked_hybrid_spline \
+  --source-mask-npz outputs/pseudo_ghost_mechanism_v1/sam_masks_single_lag.npz \
+  --skip-background-oof --validate-background-reconstruction
+```
+
+在预先固定的 13 组 single-lag 队列、16×16 block 和 SAM/缺失键 Otsu 掩膜下，与旧 `hybrid_spline` 相比：
+
+| 指标 | 旧 hybrid | masked hybrid |
+|---|---:|---:|
+| 中位 OOF CV-R² | 0.492 | 0.722 |
+| 中位 alpha 折间 CV | 0.0322 | 0.0174 |
+| 中位 `|residual neighbor correlation|` | 0.926 | 0.887 |
+| 通过检出门控 | 9/13 | 11/13 |
+| 伪遮挡重建中位 MAE | 1.282 | 0.824 |
+
+116 个伪遮挡样本中，新方法有 100 个的 MAE 低于旧 hybrid，配对 MAE 差的中位数为 -0.515；与 LOO median 相比则为 114/116 个改善。两个预先标记的未检出对照在这次使用 SAM 掩膜的运行中均未通过门控。固定图样每个位置的可用帧覆盖最少为 1–2，第 1 百分位为 6–7，中位数为 24–25；覆盖少于 5 帧的位置占 0.12%–0.19%。
+
+这是对“中位数 `F` 被残影污染”的明确改进，但仍不是 clean-ground-truth 验证。尤其是 residual 的空间相关仍高，极少数位置的 `F` 覆盖只有 1–2 帧，并且当前只显式排除 lag-1 支持区。因此它现在应视为更好的候选背景估计，不应直接解读为最终去残影性能。
+
 ---
 
 ## 5. 真实 ground truth 仍是解除定量验证瓶颈的条件

@@ -3,13 +3,15 @@
 去除连续计算机放射成像（Computed Radiography，CR）图像中的残影（残留/余辉）伪影。
 当擦除周期不完整时，计算机放射成像板会保留上一次曝光留下的微弱潜像，因此图像 `t` 中会带有图像 `t-1` 的一个缩放副本。本项目包含针对该问题的代码、设计文档以及当前研究结果。
 
-## 当前状态 — 2026-09-14
+## 当前状态 — 2026-09-16
 
 30 帧连续序列上的线性残影现象仍然成立，但现有去除器只在强残影样本上显示出明确改善，缺少 ground truth 的问题尚未解决。
 
 62 张 dark/light 图像的前三阶段稳健性分析已经完成。拍摄顺序支持把 `light_(N-1) → dark_N` 作为因果候选配对，但 30 组中只有 5 组在 24 种分析设置下得到稳健确认，21 组对基线、饱和掩膜或分块大小敏感，4 组未检出；另有 17/30 张 dark 图像支持多帧记忆效应。因此，这批 dark 图像不能整批作为 clean reference，也不能把“未检出”直接解释为“无残影”。
 
 第一轮 pseudo-ghost 机制实验也已完成。实验不使用 `dark ≈ ghost` 的简化，而是定义 `Y_t = D_t - median(D_t) - B_(-t)`，并对 `5→6`、`27→28` 生成严格四折空间 OOF 预测。16×16 分块下两组 OOF CV-R² 分别为 0.432 和 0.778，且在 8/16/32/64 四种尺度上均超过对应 null P95；不过 residual 仍有很强的空间结构，因此当前只能确认单帧 affine 模型解释了前序图像相关成分，不能声称剩余部分是随机噪声。
+
+背景估计已新增 `masked_hybrid_spline`：它用前序 light 物体掩膜排除可能的残影污染，分解每帧平滑漂移，再用加权 Huber 均值估计固定图样 `F`，不再对 dark stack 逐位置取中位数。在预先固定的 13 组队列上，其中位 OOF CV-R² 从旧 hybrid 的 0.492 提高到 0.722，116 个伪遮挡样本的中位重建 MAE 从 1.282 降到 0.824。该方法仍受限于无 clean ground truth 和少数位置的低覆盖，目前是候选背景模型，不是已验证的最终去残影器。
 
 全部 62 张 DICOM 均缺少 `AcquisitionTime`。`InstanceCreationTime` 只用于审计，未进入配对、拟合、标签或物理解释，所以当前结果不能估计余辉半衰期或真实时间衰减。当前最高价值的代码工作是只基于已记录的 kV、mA、曝光时长和 mAs 做曝光关联分析；最终定量验证和监督训练仍需要按采集协议获得真实 `clean / previous / ghosted` 三元组。引用数字前请先阅读 `RESULTS.md`。
 
@@ -38,7 +40,7 @@ I_t(x) = S_t(x) + sum_k alpha_k * (I_{t-k}(x) - bg_{t-k})
 | `src/data/synthetic.py` | 生成合成的（带残影、干净、上一帧、残影）图像对 | 可以工作，但合成残影模型与真实情况并不匹配 |
 | `src/utils/dicom_utils.py` | 在保留头信息的情况下加载和保存 DICOM | 可运行 |
 | `scripts/analyze_dark_light_pairs.py` | 对 62 张 dark/light 图像执行证据边界、单阶稳健性和多阶记忆分析 | 已实现并完成一次全量运行；默认只写一个机器可读 JSON，不生成逐对图片或 CSV |
-| `scripts/analyze_pseudo_ghost_mechanism.py` | 对可观测残影信号生成严格空间 OOF 预测、null 对照和六联图 | 已对 `5→6`、`27→28` 完成第一轮运行；不把 dark 当作 clean ground truth |
+| `scripts/analyze_pseudo_ghost_mechanism.py` | 对可观测残影信号生成严格空间 OOF 预测、null 对照、背景重建验证和污染感知 `F` 估计 | 已完成 13 组 single-lag 背景比较；不把 dark 当作 clean ground truth |
 
 ---
 

@@ -115,7 +115,7 @@ outputs/pseudo_ghost_mechanism_v1/
     └── oof_maps_block16.npz
 ```
 
-其中 `Y_t = D_t - median(D_t) - B_(-t)` 是包含噪声、baseline 误差和潜在旧帧记忆的可观测残影信号，不是 clean ground truth。JSON 记录所用输入文件的 SHA-256；NPZ 只保存 16×16 block-mean 域的派生数组，不保存 DICOM 头。
+其中 `Y_t = D_t - estimated_background_t` 是包含噪声、背景估计误差和潜在旧帧记忆的可观测残影信号，不是 clean ground truth。脚本可比较 LOO median、单帧平滑场、旧 hybrid 和污染感知 masked hybrid；后者的固定图样 `F` 不使用逐位置时间中位数。JSON 记录所用输入文件的 SHA-256；NPZ 只保存 16×16 block-mean 域的派生数组，不保存 DICOM 头。
 
 目录名中的 `20260913` 是首次分析时遗留的输出路径，不代表文件的实际生成日期。准确运行时间读取 JSON 内的 `generated_at`；当前正式结果生成于 2026-09-14。
 
