@@ -117,6 +117,47 @@ outputs/pseudo_ghost_mechanism_v1/
 
 其中 `Y_t = D_t - estimated_background_t` 是包含噪声、背景估计误差和潜在旧帧记忆的可观测残影信号，不是 clean ground truth。脚本可比较 LOO median、单帧平滑场、旧 hybrid 和污染感知 masked hybrid；后者的固定图样 `F` 不使用逐位置时间中位数。JSON 记录所用输入文件的 SHA-256；NPZ 只保存 16×16 block-mean 域的派生数组，不保存 DICOM 头。
 
+当前该目录也是后续模型的唯一正式输入：NPZ 内 `source` 即 `X`，`observable_signal` 即冻结的 `Y`，并同时保存 `background`、`raw_dark`、背景拟合掩膜、source support、饱和比例、评价掩膜和空间 fold map。`analysis_results.json` 同时是 manifest，记录冻结配置/SAM/输入 DICOM/输出产物以及关键分析代码的哈希，不再额外生成一批独立数组文件。
+
+冻结 M1 的候选机制比较覆盖写入同一稳定位置：
+
+```text
+outputs/pseudo_ghost_mechanism_v1/model_comparison/
+├── model_results.json
+└── residual_diagnostics.png
+```
+
+当前该 JSON 包含 M1 基准、嵌套空间 CV 的 Mblur 正式候选和 OOF Mquad 诊断。Mquad 被明确标记为 `diagnostic_only`；不包含组合模型、空间变化 alpha 或更后续的模型。两个文件会在每次正式运行时原地替换，不新建实验轮次目录。
+
+强度非线性诊断使用新的稳定子目录
+`outputs/pseudo_ghost_mechanism_v1/intensity_nonlinearity/`，其中只保留一个机器结果
+`model_results.json` 和一张 `nonlinearity_diagnostics.png`。它不会覆盖
+`model_comparison/`：旧目录是 Mblur 失败和 Mquad 50% 门槛的冻结审计记录，新目录改变了
+科学问题与候选集合。两者都只读取相同的冻结 NPZ，不重新估计 BG。
+
+Mhinge 跨 pair 审查使用独立的版本化输出边界：
+
+```text
+outputs/mhinge_cross_pair_v1/
+├── analysis_results.json
+├── pair_*/oof_maps_block16.npz
+└── model_audit/
+    ├── audit_results.json
+    ├── pair_summary.csv
+    └── cross_pair_summary.png
+```
+
+该版本仍复用原 SAM archive、冻结 BG 配置和空间 fold，但证据边界从两个 discovery
+pair 扩展到 13 个预声明 pair，因此不覆盖 `pseudo_ghost_mechanism_v1`。每个 pair
+只保留一个冻结 block16 NPZ；不再生成 13 张重复的六联图。`model_audit` 中三个
+文件是当前 M1/Mhinge 复现审查的最小审计证据，同一科学定义下的重运行应原地覆盖。
+
+BG 冻结配置位于 `configs/background_frozen_v1.json`。该配置依赖本地 `outputs/pseudo_ghost_mechanism_v1/sam_masks_single_lag.npz`，但只通过 SHA-256 校验，不将来自受控影像的派生 mask 强制提交到仓库。冻结审计的本地机器结果位于 `outputs/background_freeze_audit_v1/`。
+
+固定图样空间可识别性审查写入 `outputs/fixed_pattern_identifiability_v1/`。其中 JSON 是完整机器记录，CSV 是 13 个 pair 的精简覆盖表，Markdown 和 3 张 PNG 用于人工复核。所有统计都位于真正进入模型的 16×16 block-mean 网格；原始 DICOM 不会被写入该目录。
+
 目录名中的 `20260913` 是首次分析时遗留的输出路径，不代表文件的实际生成日期。准确运行时间读取 JSON 内的 `generated_at`；当前正式结果生成于 2026-09-14。
 
 `outputs/` 已由 `.gitignore` 排除。不要使用 `git add -f outputs/` 绕过该边界；确需提交汇总产物时，应先检查文件大小、敏感头信息和长期复用价值。原始 DICOM 必须保持只读，不得为了分析方便覆盖或改名。
+
+后续分析使用稳定的输出路径：同一科学定义下的新运行应在核对用途后覆盖旧结果，不按日期或实验轮次无限新建目录。一次性调试、渲染检查和测试产物必须使用系统临时目录或 pytest `tmp_path`。只有科学定义或冻结证据边界发生变化时才新建版本化输出，并必须说明保留旧版本的原因。

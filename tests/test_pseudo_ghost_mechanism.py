@@ -1,6 +1,11 @@
 """Focused tests for strict spatial OOF pseudo-ghost fitting."""
 
+import argparse
+import hashlib
+import json
+
 import numpy as np
+import pytest
 
 from scripts.analyze_pseudo_ghost_mechanism import (
     background_spatial_oof,
@@ -9,9 +14,11 @@ from scripts.analyze_pseudo_ghost_mechanism import (
     estimate_masked_hybrid_dark_background,
     estimate_single_dark_background,
     generate_pseudo_occlusions,
+    parse_block_sizes,
     parse_pairs,
     single_lag_stratum,
     strict_affine_oof,
+    validate_frozen_background_config,
     validate_background_reconstruction,
 )
 from scripts.analyze_dark_light_pairs import spatial_folds
@@ -22,6 +29,53 @@ def test_parse_all_single_lag_pairs():
     assert len(pairs) == 30
     assert pairs[0] == (1, 2)
     assert pairs[-1] == (30, 31)
+
+
+def test_parse_block_sizes_rejects_unknown_values():
+    assert parse_block_sizes("16,32,16") == (16, 32)
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_block_sizes("16,12")
+
+
+def test_frozen_background_validation_checks_mask_hash_and_parameters(tmp_path):
+    mask_path = tmp_path / "mask.npz"
+    mask_path.write_bytes(b"frozen mask")
+    mask_hash = hashlib.sha256(mask_path.read_bytes()).hexdigest()
+    config = {
+        "status": "frozen",
+        "background_mode": "masked_hybrid_spline",
+        "block_size": 16,
+        "mask": {
+            "archive_relative_path": "mask.npz",
+            "sha256": mask_hash,
+            "dilation_pixels": 24,
+        },
+        "spline_smoothness": 20.0,
+        "huber_delta": 1.5,
+        "fixed_pattern": {"decomposition_iterations": 2, "huber_iterations": 4},
+    }
+    config_path = tmp_path / "frozen.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    args = argparse.Namespace(
+        primary_background="masked_hybrid_spline",
+        background_modes=("masked_hybrid_spline",),
+        mask_dilation_pixels=24,
+        spline_smoothness=20.0,
+        background_huber_delta=1.5,
+        fixed_pattern_iterations=2,
+        fixed_pattern_huber_iterations=4,
+        analysis_blocks=(16,),
+        summary_only=False,
+        source_mask_npz=mask_path,
+    )
+
+    result = validate_frozen_background_config(config_path, tmp_path, args)
+    assert result["verified"]
+    assert result["mask_archive_sha256"] == mask_hash
+
+    args.spline_smoothness = 40.0
+    with pytest.raises(ValueError, match="differs from frozen BG"):
+        validate_frozen_background_config(config_path, tmp_path, args)
 
 
 def test_single_lag_cohort_is_prestratified():
@@ -61,6 +115,7 @@ def test_strict_affine_oof_recovers_known_model():
     assert abs(result["alpha_fold_mean"] - 0.0008) < 0.00003
     assert result["cv_r2"] > 0.98
     assert result["ncc"] > 0.99
+    assert result["low_frequency_y_source_ncc"] > 0.99
     assert np.isfinite(result["prediction"]).all()
     assert np.isfinite(result["residual"]).all()
 
@@ -95,12 +150,13 @@ def test_single_dark_surfaces_extrapolate_into_excluded_source_region():
     polynomial, _ = estimate_single_dark_background(
         contaminated_dark, ~source_support, "poly2",
     )
-    spline, _ = estimate_single_dark_background(
-        contaminated_dark, ~source_support, "robust_spline",
+    spline, spline_diagnostics = estimate_single_dark_background(
+        contaminated_dark, ~source_support, "robust_spline", huber_delta=1.0,
     )
 
     assert np.mean(np.abs(polynomial[source_support] - true_background[source_support])) < 1e-6
     assert np.mean(np.abs(spline[source_support] - true_background[source_support])) < 3.0
+    assert spline_diagnostics["huber_delta"] == 1.0
 
 
 def test_hybrid_background_preserves_fixed_pattern_and_fits_current_drift():

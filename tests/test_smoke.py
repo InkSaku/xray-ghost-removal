@@ -127,5 +127,6 @@ def test_unet_forward_shape():
     torch = pytest.importorskip("torch")
     from src.models.unet import GhostUNet
     model = GhostUNet(in_channels=2, base_filters=8)
-    out = model(torch.zeros(1, 2, 128, 128))
-    assert out.shape == (1, 1, 128, 128)
+    cleaned, ghost = model(torch.zeros(1, 2, 128, 128))
+    assert cleaned.shape == (1, 1, 128, 128)
+    assert ghost.shape == (1, 1, 128, 128)

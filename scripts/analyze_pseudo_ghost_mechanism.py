@@ -146,6 +146,94 @@ def parse_background_modes(value: str) -> tuple[str, ...]:
     return modes
 
 
+def parse_block_sizes(value: str) -> tuple[int, ...]:
+    """Parse a non-empty subset of the supported block sizes."""
+    try:
+        blocks = tuple(dict.fromkeys(
+            int(item.strip()) for item in value.split(",") if item.strip()
+        ))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Block sizes must be comma-separated integers"
+        ) from error
+    unknown = sorted(set(blocks) - set(BLOCK_SIZES))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported block size(s): {unknown}; choose from {BLOCK_SIZES}"
+        )
+    if not blocks:
+        raise argparse.ArgumentTypeError("At least one block size is required")
+    return blocks
+
+
+def validate_frozen_background_config(
+    config_path: Path,
+    repo_root: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Fail closed if a formal modeling export differs from the frozen BG."""
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("status") != "frozen":
+        raise ValueError(f"Background configuration is not frozen: {config_path}")
+
+    expected = {
+        "primary_background": config["background_mode"],
+        "mask_dilation_pixels": config["mask"]["dilation_pixels"],
+        "spline_smoothness": config["spline_smoothness"],
+        "background_huber_delta": config["huber_delta"],
+        "fixed_pattern_iterations": config["fixed_pattern"]["decomposition_iterations"],
+        "fixed_pattern_huber_iterations": config["fixed_pattern"]["huber_iterations"],
+    }
+    mismatches = {
+        name: {"expected": expected_value, "actual": getattr(args, name)}
+        for name, expected_value in expected.items()
+        if getattr(args, name) != expected_value
+    }
+    if config["background_mode"] not in args.background_modes:
+        mismatches["background_modes"] = {
+            "expected_to_include": config["background_mode"],
+            "actual": list(args.background_modes),
+        }
+    if tuple(args.analysis_blocks) != (int(config["block_size"]),):
+        mismatches["analysis_blocks"] = {
+            "expected": [int(config["block_size"])],
+            "actual": list(args.analysis_blocks),
+        }
+    if args.summary_only:
+        mismatches["summary_only"] = {"expected": False, "actual": True}
+    if mismatches:
+        raise ValueError(f"Formal export differs from frozen BG: {mismatches}")
+
+    archive_path = repo_root / config["mask"]["archive_relative_path"]
+    if args.source_mask_npz is None:
+        raise ValueError("Formal frozen export requires --source-mask-npz")
+    if args.source_mask_npz.resolve() != archive_path.resolve():
+        raise ValueError(
+            f"Frozen mask path mismatch: expected {archive_path}, got {args.source_mask_npz}"
+        )
+    actual_mask_hash = sha256(archive_path)
+    if actual_mask_hash != config["mask"]["sha256"]:
+        raise ValueError(
+            f"Frozen mask SHA-256 mismatch: expected {config['mask']['sha256']}, "
+            f"got {actual_mask_hash}"
+        )
+    return {
+        "path": str(config_path.resolve()),
+        "sha256": sha256(config_path),
+        "mask_archive_sha256": actual_mask_hash,
+        "verified": True,
+    }
+
+
+def artifact_record(path: Path, output_dir: Path) -> dict[str, Any]:
+    """Return portable provenance for a generated artifact."""
+    return {
+        "relative_path": str(path.resolve().relative_to(output_dir.resolve())),
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256(path),
+    }
+
+
 def _huber_weights(residual: np.ndarray, delta: float = HUBER_DELTA) -> np.ndarray:
     """Return IRLS weights with a MAD scale estimate."""
     centered = residual - np.median(residual)
@@ -217,6 +305,7 @@ def estimate_single_dark_background(
     fit_mask: np.ndarray,
     mode: str,
     smoothness: float = 20.0,
+    huber_delta: float = HUBER_DELTA,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Estimate a full-frame background field from uncontaminated blocks of one dark image.
 
@@ -241,7 +330,9 @@ def estimate_single_dark_background(
             coefficients, *_ = np.linalg.lstsq(
                 train_design * root[:, None], target[selected] * root, rcond=None,
             )
-            weights = _huber_weights(target[selected] - train_design @ coefficients)
+            weights = _huber_weights(
+                target[selected] - train_design @ coefficients, delta=huber_delta,
+            )
         estimate = (design @ coefficients).reshape(dark.shape)
         complexity = {"polynomial_degree": 2, "parameter_count": int(coefficients.size)}
     elif mode == "robust_spline":
@@ -256,7 +347,9 @@ def estimate_single_dark_background(
             system = sparse.vstack([weighted_design, penalty_weight * penalty], format="csr")
             rhs = np.concatenate([root * target[selected], np.zeros(penalty.shape[0])])
             coefficients = lsqr(system, rhs, atol=1e-7, btol=1e-7, iter_lim=1000)[0]
-            weights = _huber_weights(target[selected] - train_design @ coefficients)
+            weights = _huber_weights(
+                target[selected] - train_design @ coefficients, delta=huber_delta,
+            )
         estimate = np.asarray(design @ coefficients).reshape(dark.shape)
         complexity = {
             "basis_shape": list(basis_shape),
@@ -273,6 +366,7 @@ def estimate_single_dark_background(
         "fit_fraction": float(valid.mean()),
         "fit_residual_mae": float(np.mean(np.abs(residual))),
         "fit_residual_mad": float(np.median(np.abs(residual - np.median(residual)))),
+        "huber_delta": float(huber_delta),
         **complexity,
     }
     return estimate, diagnostics
@@ -284,6 +378,7 @@ def estimate_hybrid_dark_background(
     target_index: int,
     fit_mask: np.ndarray,
     smoothness: float = 20.0,
+    huber_delta: float = HUBER_DELTA,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Combine a leave-target-out fixed-pattern template with current-dark drift."""
     fixed_pattern = baseline(darks, target_index, "loo_median")
@@ -292,6 +387,7 @@ def estimate_hybrid_dark_background(
         fit_mask=fit_mask,
         mode="robust_spline",
         smoothness=smoothness,
+        huber_delta=huber_delta,
     )
     return fixed_pattern + smooth_correction, {
         "mode": "hybrid_spline",
@@ -308,6 +404,8 @@ def estimate_masked_fixed_pattern(
     smoothness: float = 20.0,
     decomposition_iterations: int = FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
     huber_iterations: int = FIXED_PATTERN_HUBER_ITERATIONS,
+    huber_delta: float = HUBER_DELTA,
+    include_support_maps: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Estimate detector-fixed structure without temporally median-combining darks.
 
@@ -323,6 +421,8 @@ def estimate_masked_fixed_pattern(
         raise KeyError(f"Target dark {target_index} is unavailable")
     if decomposition_iterations < 1 or huber_iterations < 1:
         raise ValueError("Fixed-pattern iteration counts must be positive")
+    if huber_delta <= 0:
+        raise ValueError("huber_delta must be positive")
 
     shape = darks[target_index].shape
     training_indices = [index for index in sorted(darks) if index != target_index]
@@ -355,6 +455,7 @@ def estimate_masked_fixed_pattern(
                 fit_mask=valid,
                 mode="robust_spline",
                 smoothness=smoothness,
+                huber_delta=huber_delta,
             )
             residual = darks[index].astype(np.float64) - smooth_field
             centered = residual[valid] - np.median(residual[valid])
@@ -373,9 +474,10 @@ def estimate_masked_fixed_pattern(
         weights = base_weights.copy()
         location = fixed_pattern
         for _ in range(huber_iterations):
-            weight_sum = weights.sum(axis=0)
+            location_weights = weights
+            weight_sum = location_weights.sum(axis=0)
             location = np.divide(
-                np.sum(weights * residual_stack, axis=0),
+                np.sum(location_weights * residual_stack, axis=0),
                 weight_sum,
                 out=np.zeros(shape, dtype=np.float64),
                 where=weight_sum > 0,
@@ -390,7 +492,7 @@ def estimate_masked_fixed_pattern(
             temporal_scale = np.maximum(temporal_scale, np.finfo(float).eps)
             huber_weights = np.minimum(
                 1.0,
-                HUBER_DELTA * temporal_scale[None, :, :]
+                huber_delta * temporal_scale[None, :, :]
                 / np.maximum(np.abs(temporal_residual), np.finfo(float).eps),
             )
             weights = base_weights * huber_weights
@@ -400,7 +502,18 @@ def estimate_masked_fixed_pattern(
             raise ValueError("Contamination masks leave some fixed-pattern pixels unobserved")
         fixed_pattern = location - float(np.mean(location))
 
-    return fixed_pattern, {
+    # These are the weights that produced the returned final location.  The
+    # subsequent Huber update is intentionally not counted because changing
+    # the location after it would alter the frozen estimator itself.
+    weight_sum = location_weights.sum(axis=0)
+    weight_square_sum = np.sum(location_weights ** 2, axis=0)
+    effective_coverage = np.divide(
+        weight_sum ** 2,
+        weight_square_sum,
+        out=np.zeros(shape, dtype=np.float64),
+        where=weight_square_sum > 0,
+    )
+    diagnostics = {
         "aggregation": "contamination-masked noise-precision-weighted Huber mean",
         "uses_temporal_pixelwise_median": False,
         "target_dark_in_fixed_pattern": False,
@@ -408,11 +521,17 @@ def estimate_masked_fixed_pattern(
         "previous_light_lags_excluded": [1],
         "decomposition_iterations": decomposition_iterations,
         "huber_iterations": huber_iterations,
+        "huber_delta": float(huber_delta),
         "coverage_min": int(coverage.min()),
         "coverage_p01": float(np.percentile(coverage, 1)),
         "coverage_median": float(np.median(coverage)),
         "coverage_max": int(coverage.max()),
         "coverage_below_5_fraction": float(np.mean(coverage < 5)),
+        "effective_coverage_min": float(effective_coverage.min()),
+        "effective_coverage_p01": float(np.percentile(effective_coverage, 1)),
+        "effective_coverage_median": float(np.median(effective_coverage)),
+        "effective_coverage_max": float(effective_coverage.max()),
+        "effective_coverage_below_3_fraction": float(np.mean(effective_coverage < 3)),
         "mean_excluded_fraction": float(np.mean([
             1.0 - clean_masks[index].mean() for index in training_indices
         ])),
@@ -420,6 +539,10 @@ def estimate_masked_fixed_pattern(
             str(index): float(frame_scales[index]) for index in training_indices
         },
     }
+    if include_support_maps:
+        diagnostics["coverage_map"] = coverage
+        diagnostics["effective_coverage_map"] = effective_coverage
+    return fixed_pattern, diagnostics
 
 
 def estimate_masked_hybrid_dark_background(
@@ -431,6 +554,9 @@ def estimate_masked_hybrid_dark_background(
     smoothness: float = 20.0,
     fixed_pattern: np.ndarray | None = None,
     fixed_pattern_diagnostics: dict[str, Any] | None = None,
+    decomposition_iterations: int = FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
+    huber_iterations: int = FIXED_PATTERN_HUBER_ITERATIONS,
+    huber_delta: float = HUBER_DELTA,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Combine contamination-aware fixed structure with current-dark drift."""
     if fixed_pattern is None:
@@ -439,6 +565,9 @@ def estimate_masked_hybrid_dark_background(
             contamination_supports=contamination_supports,
             target_index=target_index,
             smoothness=smoothness,
+            decomposition_iterations=decomposition_iterations,
+            huber_iterations=huber_iterations,
+            huber_delta=huber_delta,
         )
     if fixed_pattern.shape != dark.shape:
         raise ValueError("fixed_pattern and dark must have the same shape")
@@ -447,6 +576,7 @@ def estimate_masked_hybrid_dark_background(
         fit_mask=fit_mask,
         mode="robust_spline",
         smoothness=smoothness,
+        huber_delta=huber_delta,
     )
     return fixed_pattern + smooth_correction, {
         "mode": "masked_hybrid_spline",
@@ -466,6 +596,9 @@ def background_spatial_oof(
     contamination_supports: dict[int, np.ndarray] | None = None,
     fixed_pattern: np.ndarray | None = None,
     fixed_pattern_diagnostics: dict[str, Any] | None = None,
+    decomposition_iterations: int = FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
+    huber_iterations: int = FIXED_PATTERN_HUBER_ITERATIONS,
+    huber_delta: float = HUBER_DELTA,
 ) -> dict[str, float]:
     """Measure background interpolation on spatially held-out clean blocks."""
     predictions = np.full(dark.shape, np.nan, dtype=np.float64)
@@ -476,7 +609,7 @@ def background_spatial_oof(
             if darks is None or target_index is None:
                 raise ValueError("hybrid_spline spatial OOF requires darks and target_index")
             estimate, _ = estimate_hybrid_dark_background(
-                dark, darks, target_index, train, smoothness,
+                dark, darks, target_index, train, smoothness, huber_delta,
             )
         elif mode == "masked_hybrid_spline":
             if darks is None or target_index is None or contamination_supports is None:
@@ -493,6 +626,9 @@ def background_spatial_oof(
                 smoothness=smoothness,
                 fixed_pattern=fixed_pattern,
                 fixed_pattern_diagnostics=fixed_pattern_diagnostics,
+                decomposition_iterations=decomposition_iterations,
+                huber_iterations=huber_iterations,
+                huber_delta=huber_delta,
             )
         else:
             estimate, _ = estimate_single_dark_background(dark, train, mode, smoothness)
@@ -688,6 +824,9 @@ def validate_background_reconstruction(
     contamination_supports: dict[int, np.ndarray] | None = None,
     masked_fixed_pattern: np.ndarray | None = None,
     masked_fixed_pattern_diagnostics: dict[str, Any] | None = None,
+    decomposition_iterations: int = FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
+    huber_iterations: int = FIXED_PATTERN_HUBER_ITERATIONS,
+    huber_delta: float = HUBER_DELTA,
 ) -> dict[str, Any]:
     """Hide known air blocks and score background reconstruction inside them."""
     occlusions = generate_pseudo_occlusions(
@@ -720,6 +859,7 @@ def validate_background_reconstruction(
                     target_index=target_index,
                     fit_mask=train,
                     smoothness=smoothness,
+                    huber_delta=huber_delta,
                 )
             elif mode == "masked_hybrid_spline":
                 if contamination_supports is None:
@@ -736,6 +876,9 @@ def validate_background_reconstruction(
                     smoothness=smoothness,
                     fixed_pattern=masked_fixed_pattern,
                     fixed_pattern_diagnostics=masked_fixed_pattern_diagnostics,
+                    decomposition_iterations=decomposition_iterations,
+                    huber_iterations=huber_iterations,
+                    huber_delta=huber_delta,
                 )
             else:
                 prediction, _ = estimate_single_dark_background(
@@ -1057,6 +1200,7 @@ def strict_affine_oof(
         "residual_std": float(np.std(residual_values)),
         "pseudo_ghost_std": float(np.std(yv)),
         "residual_variance_ratio": float(np.var(residual_values) / max(variance_y, 1e-12)),
+        "low_frequency_y_source_ncc": _correlation(y_low, x_low, evaluated),
         "low_frequency_y_prediction_ncc": _correlation(y_low, p_low, evaluated),
         "low_frequency_residual_source_ncc": _correlation(r_low, x_low, evaluated),
         "residual_neighbor_correlation": _neighbor_correlation(residual, evaluated),
@@ -1082,6 +1226,7 @@ def _compact_metric_view(fit: dict[str, Any]) -> dict[str, Any]:
         "residual_std",
         "pseudo_ghost_std",
         "residual_variance_ratio",
+        "low_frequency_y_source_ncc",
         "low_frequency_y_prediction_ncc",
         "low_frequency_residual_source_ncc",
         "residual_neighbor_correlation",
@@ -1154,15 +1299,21 @@ def evaluate_with_nulls(
     folds: np.ndarray,
     future_sources: list[tuple[int, np.ndarray, np.ndarray]],
     seed: int,
+    base_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    mask = np.ones_like(y, dtype=bool)
+    mask = (
+        np.ones_like(y, dtype=bool)
+        if base_mask is None else np.asarray(base_mask, dtype=bool).copy()
+    )
+    if mask.shape != y.shape:
+        raise ValueError("base_mask and y must have the same shape")
     if mask_mode == "exclude_saturated":
         mask &= source_saturation < 0.05
     true_fit = strict_affine_oof(x, y, mask, folds)
     null_rows = []
 
     for light_index, future_x, future_saturation in future_sources:
-        future_mask = np.ones_like(y, dtype=bool)
+        future_mask = mask.copy()
         if mask_mode == "exclude_saturated":
             future_mask &= future_saturation < 0.05
         try:
@@ -1175,7 +1326,7 @@ def evaluate_with_nulls(
                               "cv_r2": float("nan"), "ncc": float("nan")})
 
     for null_x, null_saturation, label in spatial_nulls(x, source_saturation, seed):
-        null_mask = np.ones_like(y, dtype=bool)
+        null_mask = mask.copy()
         if mask_mode == "exclude_saturated":
             null_mask &= null_saturation < 0.05
         kind = "spatial_shift" if label.startswith("roll") else "block_shuffle"
@@ -1399,6 +1550,14 @@ def main() -> None:
         help="Use only the fixed 16x16 analysis and write no per-pair figures or NPZ files",
     )
     parser.add_argument(
+        "--skip-pair-figures", action="store_true",
+        help="For formal NPZ exports, omit redundant per-pair six-panel PNG files",
+    )
+    parser.add_argument(
+        "--analysis-blocks", type=parse_block_sizes, default=BLOCK_SIZES,
+        help="Comma-separated analysis block sizes; formal frozen exports use only 16",
+    )
+    parser.add_argument(
         "--background-modes", type=parse_background_modes, default=BACKGROUND_MODES,
         help="Comma-separated background estimators: "
              "loo_median,poly2,robust_spline,hybrid_spline,masked_hybrid_spline",
@@ -1422,6 +1581,15 @@ def main() -> None:
     parser.add_argument("--sam-device", default="auto", choices=("auto", "cpu", "mps", "cuda"))
     parser.add_argument("--mask-dilation-pixels", type=int, default=24)
     parser.add_argument("--spline-smoothness", type=float, default=20.0)
+    parser.add_argument("--background-huber-delta", type=float, default=HUBER_DELTA)
+    parser.add_argument(
+        "--fixed-pattern-iterations", type=int,
+        default=FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
+    )
+    parser.add_argument(
+        "--fixed-pattern-huber-iterations", type=int,
+        default=FIXED_PATTERN_HUBER_ITERATIONS,
+    )
     parser.add_argument(
         "--skip-background-oof", action="store_true",
         help="Skip the block-16 spatial holdout diagnostic for faster exploratory runs",
@@ -1432,12 +1600,17 @@ def main() -> None:
     )
     parser.add_argument("--skip-input-hashes", action="store_true",
                         help="Skip SHA-256 provenance hashes for faster exploratory runs")
+    parser.add_argument(
+        "--frozen-background-config", type=Path,
+        help="Verify a formal modeling export against this frozen BG configuration",
+    )
     args = parser.parse_args()
 
     data_dir, output_dir = Path(args.data_dir), Path(args.output_dir)
+    repo_root = Path(__file__).resolve().parent.parent
     pairs: tuple[tuple[int, int], ...] = args.pairs
     cohort_name = "single_lag_only" if pairs == SINGLE_LAG_PAIRS else "custom"
-    analysis_blocks = (PRIMARY_BLOCK,) if args.summary_only else BLOCK_SIZES
+    analysis_blocks = (PRIMARY_BLOCK,) if args.summary_only else args.analysis_blocks
     background_modes: tuple[str, ...] = args.background_modes
     if args.primary_background not in background_modes:
         parser.error("--primary-background must also be listed in --background-modes")
@@ -1445,8 +1618,23 @@ def main() -> None:
         parser.error("--mask-dilation-pixels must be non-negative")
     if args.spline_smoothness < 0:
         parser.error("--spline-smoothness must be non-negative")
+    if args.background_huber_delta <= 0:
+        parser.error("--background-huber-delta must be positive")
+    if args.fixed_pattern_iterations < 1:
+        parser.error("--fixed-pattern-iterations must be positive")
+    if args.fixed_pattern_huber_iterations < 1:
+        parser.error("--fixed-pattern-huber-iterations must be positive")
+    if not args.summary_only and PRIMARY_BLOCK not in analysis_blocks:
+        parser.error(f"Non-summary runs must include the primary block size {PRIMARY_BLOCK}")
     if args.generate_sam_masks and args.source_mask_npz:
         parser.error("--generate-sam-masks and --source-mask-npz are mutually exclusive")
+    frozen_background = None
+    if args.frozen_background_config:
+        frozen_background = validate_frozen_background_config(
+            config_path=args.frozen_background_config.resolve(),
+            repo_root=repo_root,
+            args=args,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     for light_index, _ in pairs:
         path = data_dir / f"{light_index}-light.dcm"
@@ -1567,6 +1755,9 @@ def main() -> None:
                         contamination_supports=contamination_supports,
                         target_index=dark_index,
                         smoothness=args.spline_smoothness,
+                        decomposition_iterations=args.fixed_pattern_iterations,
+                        huber_iterations=args.fixed_pattern_huber_iterations,
+                        huber_delta=args.background_huber_delta,
                     )
                 )
             future_sources = [
@@ -1587,6 +1778,9 @@ def main() -> None:
                     contamination_supports=contamination_supports,
                     masked_fixed_pattern=masked_fixed_pattern,
                     masked_fixed_pattern_diagnostics=masked_fixed_pattern_diagnostics,
+                    decomposition_iterations=args.fixed_pattern_iterations,
+                    huber_iterations=args.fixed_pattern_huber_iterations,
+                    huber_delta=args.background_huber_delta,
                 )
 
             background_results = []
@@ -1612,6 +1806,7 @@ def main() -> None:
                         target_index=dark_index,
                         fit_mask=background_fit_mask,
                         smoothness=args.spline_smoothness,
+                        huber_delta=args.background_huber_delta,
                     )
                 elif background_mode == "masked_hybrid_spline":
                     background, background_diagnostics = estimate_masked_hybrid_dark_background(
@@ -1623,6 +1818,9 @@ def main() -> None:
                         smoothness=args.spline_smoothness,
                         fixed_pattern=masked_fixed_pattern,
                         fixed_pattern_diagnostics=masked_fixed_pattern_diagnostics,
+                        decomposition_iterations=args.fixed_pattern_iterations,
+                        huber_iterations=args.fixed_pattern_huber_iterations,
+                        huber_delta=args.background_huber_delta,
                     )
                 else:
                     background, background_diagnostics = estimate_single_dark_background(
@@ -1647,6 +1845,9 @@ def main() -> None:
                         contamination_supports=contamination_supports,
                         fixed_pattern=masked_fixed_pattern,
                         fixed_pattern_diagnostics=masked_fixed_pattern_diagnostics,
+                        decomposition_iterations=args.fixed_pattern_iterations,
+                        huber_iterations=args.fixed_pattern_huber_iterations,
+                        huber_delta=args.background_huber_delta,
                     )
 
                 y = raw_dark - background
@@ -1709,24 +1910,37 @@ def main() -> None:
                 raise RuntimeError("Primary block result was not generated")
             (x, raw_dark, background, y, folds, primary_fit,
              background_fit_mask, source_support) = primary_maps
-            render_six_panel(pair_dir / "six_panel_oof.png", pair_label, x, raw_dark,
-                             background, args.primary_background, y, primary_fit)
+            maps_path = pair_dir / "oof_maps_block16.npz"
+            figure_path = pair_dir / "six_panel_oof.png"
+            if not args.skip_pair_figures:
+                render_six_panel(figure_path, pair_label, x, raw_dark,
+                                 background, args.primary_background, y, primary_fit)
             np.savez_compressed(
-                pair_dir / "oof_maps_block16.npz",
+                maps_path,
                 source=x.astype(np.float32),
                 raw_dark=raw_dark.astype(np.float32),
                 background=background.astype(np.float32),
                 background_mode=np.asarray(args.primary_background),
                 background_fit_mask=background_fit_mask,
                 source_support=source_support,
+                source_saturation_fraction=(
+                    saturation_cache[PRIMARY_BLOCK][light_index].astype(np.float32)
+                ),
                 observable_signal=y.astype(np.float32),
                 oof_prediction=primary_fit["prediction"].astype(np.float32),
                 oof_residual=primary_fit["residual"].astype(np.float32),
                 evaluated_mask=primary_fit["evaluated_mask"],
                 spatial_folds=folds,
             )
-            pair_result["six_panel"] = str((pair_dir / "six_panel_oof.png").resolve())
-            pair_result["primary_maps"] = str((pair_dir / "oof_maps_block16.npz").resolve())
+            pair_result["primary_maps"] = str(maps_path.resolve())
+            pair_result["output_artifacts"] = {
+                "primary_maps": artifact_record(maps_path, output_dir),
+            }
+            if not args.skip_pair_figures:
+                pair_result["six_panel"] = str(figure_path.resolve())
+                pair_result["output_artifacts"]["six_panel"] = artifact_record(
+                    figure_path, output_dir,
+                )
         pair_results.append(pair_result)
 
     comparison_summary = summarize_background_comparison(pair_results)
@@ -1739,7 +1953,7 @@ def main() -> None:
         if args.validate_background_reconstruction else None
     )
     result = {
-        "schema_version": 4,
+        "schema_version": 5,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "study_question": "Can detectable previous-exposure structure in a later dark acquisition be explained by a low-dimensional linear spatial model?",
         "evidence_boundary": [
@@ -1760,6 +1974,7 @@ def main() -> None:
             "pairs": [list(pair) for pair in pairs],
             "block_sizes": list(analysis_blocks),
             "summary_only": args.summary_only,
+            "pair_figures_written": not args.skip_pair_figures,
             "primary_visualization_block_size": PRIMARY_BLOCK,
             "background_modes": list(background_modes),
             "primary_background": args.primary_background,
@@ -1773,8 +1988,9 @@ def main() -> None:
                 "aggregation": "contamination-masked noise-precision-weighted Huber mean",
                 "uses_temporal_pixelwise_median": False,
                 "previous_light_lags_excluded": [1],
-                "decomposition_iterations": FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
-                "huber_iterations": FIXED_PATTERN_HUBER_ITERATIONS,
+                "decomposition_iterations": args.fixed_pattern_iterations,
+                "huber_iterations": args.fixed_pattern_huber_iterations,
+                "huber_delta": args.background_huber_delta,
                 "extra_mask_fallback": "Otsu when an external archive lacks a light index",
             },
             "background_spatial_oof": not args.skip_background_oof,
@@ -1796,6 +2012,17 @@ def main() -> None:
             "random_seed": RANDOM_SEED,
             "nulls": ["future_light", "spatial_shift", "block_shuffle"],
             "display_common_range": "Panels 4-6 use +/- percentile_99.5(abs(Y))",
+        },
+        "frozen_background": frozen_background,
+        "code_provenance": {
+            "analysis_script": {
+                "path": "scripts/analyze_pseudo_ghost_mechanism.py",
+                "sha256": sha256(Path(__file__).resolve()),
+            },
+            "shared_spatial_analysis": {
+                "path": "scripts/analyze_dark_light_pairs.py",
+                "sha256": sha256(repo_root / "scripts" / "analyze_dark_light_pairs.py"),
+            },
         },
         "input_provenance": provenance,
         "comparison_summary": comparison_summary,

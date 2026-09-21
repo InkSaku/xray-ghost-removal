@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "status": "frozen",
+  "frozen_at": "2026-09-21",
+  "background_mode": "masked_hybrid_spline",
+  "block_size": 16,
+  "mask": {
+    "archive_relative_path": "outputs/pseudo_ghost_mechanism_v1/sam_masks_single_lag.npz",
+    "sha256": "6a2f43410c4d92023ff7f5df72e01af31f2bb20d51feb67fabd30ad7c9658ab6",
+    "dilation_pixels": 24,
+    "background_fit_max_source_fraction": 0.01,
+    "missing_archive_key_fallback": "otsu"
+  },
+  "spline_smoothness": 20.0,
+  "huber_delta": 1.5,
+  "fixed_pattern": {
+    "decomposition_iterations": 2,
+    "huber_iterations": 4,
+    "previous_light_lags_excluded": [1],
+    "target_dark_excluded": true,
+    "temporal_pixelwise_median": false
+  },
+  "observable_signal": "Y_t = D_t - estimated_background_t",
+  "ghost_model": "Y_t = alpha * X_(t-1) + intercept + error",
+  "ghost_model_changed_by_freeze": false,
+  "audit": {
+    "script": "scripts/audit_background_freeze.py",
+    "local_result": "outputs/background_freeze_audit_v1/background_freeze_audit.json",
+    "gated_configuration_count": 9,
+    "decision": "freeze",
+    "otsu_only_is_interchangeable": false,
+    "note": "The freeze applies to the hashed SAM-based configuration. Otsu-only is a stress test because it changes the 4->5 control to detected."
+  },
+  "spatial_identifiability_audit": {
+    "script": "scripts/audit_fixed_pattern_identifiability.py",
+    "local_result": "outputs/fixed_pattern_identifiability_v1/identifiability_audit.json",
+    "analysis_block_size": 16,
+    "decision": "pass",
+    "note": "Core source regions have no zero-coverage blocks; detection and alpha remain stable after excluding low-support blocks."
+  }
+}

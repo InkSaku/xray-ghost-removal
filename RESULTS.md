@@ -180,6 +180,119 @@ python scripts/analyze_pseudo_ghost_mechanism.py \
 
 这是对“中位数 `F` 被残影污染”的明确改进，但仍不是 clean-ground-truth 验证。尤其是 residual 的空间相关仍高，极少数位置的 `F` 覆盖只有 1–2 帧，并且当前只显式排除 lag-1 支持区。因此它现在应视为更好的候选背景估计，不应直接解读为最终去残影性能。
 
+### 4.8 BG 冻结审计
+
+2026-09-21 使用 `scripts/audit_background_freeze.py` 对 `masked_hybrid_spline` 执行了有限、预先固定的敏感性审计。审计不修改线性残影模型，仍为 `Y = alpha * X + intercept + error`；只对 BG 的 mask dilation、spline smoothness、Huber delta 和固定图样分解迭代数做 one-factor-at-a-time 扰动。
+
+正式门控包含 9 组设置：nominal，dilation `12/48 px`，smoothness `10/40`，Huber delta `1.0/2.0`，以及固定图样分解 `1/3` 轮。另外运行 Otsu-only 作为不参与冻结判定的 segmentation stress test。八项预设门控全部通过：
+
+| 冻结检查 | 结果 |
+|---|---:|
+| `5→6`、`27→28` 核心阳性检出稳定性 | 9/9 通过 |
+| `4→5`、`6→7` 未检出对照稳定性 | 9/9 保持未检出 |
+| 核心 pair 的 alpha 位于 nominal ±20% | 18/18，最大变化 3.19% |
+| nominal 通过门控且 `|alpha| >= 1e-4` 的 pair 位于 ±20% | 81/81，最大变化 8.23% |
+| nominal 伪遮挡 pair 级中位 `delta MAE` | -0.387，pair-bootstrap 95% CI `[-0.784, -0.234]` |
+| nominal 伪遮挡改善 pair | 13/13 |
+| 所有扰动设置中伪遮挡仍优于旧 hybrid | 每组 11/13 至 13/13 |
+| 核心 pair 的 held-out source-aligned residual / original Y | 2.62%–13.28% |
+| 核心 pair residual variance ratio | 0.025–0.081 |
+
+因此冻结 `configs/background_frozen_v1.json` 中的 nominal BG：24 px dilation，smoothness 20，Huber delta 1.5，固定图样分解 2 轮、每轮 Huber 4 次。之后的 `M1 -> M2 -> M3` 必须使用这一 BG，不因新模型结果而返回调背景。
+
+冻结边界需要明确：Otsu-only 压力测试使 `4→5` 由未检出变为检出，所以冻结结论只适用于 SHA-256 为 `6a2f43410c4d92023ff7f5df72e01af31f2bb20d51feb67fabd30ad7c9658ab6` 的 SAM mask archive；不声称 SAM 与 Otsu 可互换。机器结果位于 `outputs/background_freeze_audit_v1/`，继续保持不提交。
+
+### 4.9 固定图样的空间可识别性审查
+
+2026-09-21 使用 `scripts/audit_fixed_pattern_identifiability.py` 复核冻结 `F` 在真正进入模型的 16×16 block 网格上是否有足够历史 dark 支撑。审查严格复用冻结配置、目标 dark leave-out、13 张外部 SAM mask 和 17 张缺失键 Otsu fallback；没有修改 BG 算法或线性残影模型。除原始覆盖数 `C` 外，还从实际产生最终 `F` 的噪声精度与 Huber 权重计算 `Neff=(sum w)^2/sum(w^2)`。
+
+| Pair | source `C` 中位数 | source `C=0` | source `C<=2` | source `C<5` | source `Neff` 中位数 | `Neff<3` |
+|---|---:|---:|---:|---:|---:|---:|
+| `5→6` | 12 | 0% | 0.087% | 0.935% | 10.56 | 0.326% |
+| `27→28` | 17 | 0% | 0.036% | 0.401% | 15.47 | 0.137% |
+
+中央高物体出现频率确实对应更低的 `F` 覆盖，但两个核心 source 区均没有零覆盖 block。排除 `C<5` 后，`5→6` 的 alpha 变化 -0.029%，`27→28` 变化 +0.104%；排除 `Neff<3` 后分别变化 -0.019% 和 +0.021%。两个核心阳性仍检出，`4→5`、`6→7` 仍未检出。
+
+因此空间可识别性门控结论为 **pass**：现有低覆盖块不是核心 detection 或 alpha 的主要驱动因素。BG 收尾至此完成，后续直接进入 `M1 -> M2 -> M3`；机器结果位于 `outputs/fixed_pattern_identifiability_v1/`，继续保持不提交。
+
+### 4.10 冻结 M1 残差诊断
+
+2026-09-21 冻结候选分析流程只读取已哈希的 block16 NPZ，没有重算或改动 BG。M1 在 `5→6`、`27→28` 上的 OOF CV-R² 分别为 0.960310 和 0.922839，RMSE 分别为 1.691 和 4.217。残差邻域相关仍为 0.858 和 0.963，证明当前 affine M1 之后仍存在强空间结构。
+
+`X–残差` 分箱趋势显示 `27→28` 存在明显弯曲，两组残差空间图也都保留了清晰结构。这些是后续候选机制检验的起点，不能单独解读为曝光非线性。
+
+### 4.11 Mblur 候选与 Mquad 诊断
+
+`scripts/analyze_frozen_candidates.py` 在 BG 和 Y 完全冻结的条件下运行。Mblur 比较 `σ = 0, 0.5, 1, 1.5, 2, 3` block；每个外层空间折只在剩余三折内部选择两个 pair 共享的 `σ`，然后分 pair 拟合 alpha 和截距。四个外层折均选择 `σ=0`；Mblur 与 M1 的 CV-R²、RMSE、边缘 RMSE 和邻域相关在数值精度内相同。因此，当前数据不支持“单一各向同性高斯模糊”作为空间残差的解释，Mblur 不晋升为 M2。
+
+Mquad 仅作诊断，每个外层折的 X 均值、标准差和二次系数都只由训练区学得。对 `27→28`，CV-R² 由 0.922839 升至 0.964749，RMSE 由 4.217 降至 2.851，source-edge RMSE 由 3.296 降至 3.081；残差分箱均值的 peak-to-peak 降至 M1 的 45.7%，但加权 RMS 只降至 54.2%，未通过预设的 50% 门槛。`5→6` 只有很小的 R² 改善，且边缘 RMSE 反而增加 12.5%。因此这一轮只记录“`27→28` 有明显但尚不完整的二次非线性信号”，不把 Mquad 命名为正式 M2，也没有拟合 `f(K*X)` 组合模型。机器结果仍覆盖写入 `outputs/pseudo_ghost_mechanism_v1/model_comparison/`的一个 JSON 和一张诊断图。
+
+### 4.12 强度非线性诊断：Msat 未通过，Mhinge 有条件信号
+
+2026-09-21 在运行前先冻结
+`docs/plans/2026-09-21-intensity-nonlinearity-design.md`。本轮把问题限定为
+“冻结的可观测 `E[Y|X]` 是否偏离仿射关系”，不把 `X` 当作入射曝光量，也不把结果
+解释为已确认的 a-Si 电荷俘获机制。`S=max(-X,0)`，从而正 `X` 不会进入指数的负定义域。
+Msat 是预先指定的主候选，Mhinge 是替代候选；Mquad 和固定四个训练折分位数内结点的
+低自由度三次样条只作诊断。Msat 的 `S0` 与 Mhinge 的 `tau` 均在每个外层折内用三折
+内层空间 CV 选择，外层测试区不参与参数、修剪或结点确定。
+
+Msat 在两个 pair 上均未通过。`5→6` 的 CV-R² 为 0.961457、残差趋势加权 RMS 为 M1
+的 77.9%，且 source-edge RMSE 恶化 14.5%；`27→28` 的 CV-R² 为 0.960632、趋势比例
+为 60.7%，outside-source RMSE 恶化 30.9%。更关键的是，两个 pair 的四个外层折都选择
+`S0` 网格的最高边界分位数 0.90。虽然所得 `S0` 数值在折间接近，但连续命中边界表示当前
+数据没有识别出饱和尺度，不能把它解释为饱和型 alpha。
+
+Mhinge 明显更强。`5→6` 的 CV-R² 从 0.960310 升至 0.965256，RMSE 从 1.691 降至
+1.582，趋势加权 RMS 降至 M1 的 26.6%；边缘和 source 外 RMSE 的恶化分别只有 1.37%
+和 0.03%，`tau` 折间 CV 为 0.26%，通过全部 pair 级门槛。`27→28` 的 CV-R² 从
+0.922839 升至 0.971146，RMSE 从 4.217 降至 2.579，趋势比例降至 42.0%，边缘 RMSE
+改善 16.4%，`tau` 折间 CV 为 3.48%；但 outside-source RMSE 恶化 5.67%，略超过运行前
+固定的 5% 上限，因此该 pair 未通过，不能事后放宽门槛。
+
+样条诊断在 `27→28` 达到 CV-R²=0.979030、趋势比例 15.6%，说明条件均值的确存在比
+简单二次或当前饱和式更丰富的形状；它仍只是诊断，不能凭本轮外层结果转为正式候选。
+最终结论是：没有模型获得跨 pair 一致的探索性证据，没有模型晋升为 M2。Mhinge 是下一次
+独立采集最值得冻结验证的候选，但当前结果仍可能吸收背景误差、截断、散射或多帧记忆。
+机器结果稳定覆盖写入 `outputs/pseudo_ghost_mechanism_v1/intensity_nonlinearity/`，旧的
+`model_comparison/` 作为 Mblur/Mquad 决策记录保留。
+
+### 4.13 Mhinge 跨 pair 一致性与可辨识性审查
+
+2026-09-21 在运行前冻结
+`docs/plans/2026-09-21-mhinge-cross-pair-audit.md`。本轮不再改 BG、SAM mask、
+`Y`、block 或空间四折，也不增加更复杂的模型；只独立比较 M1 与 Mhinge。
+先由原有 detection gate 和 `|alpha| >= 1e-4` 固定 9 个有效 pair，其中
+`5→6`、`27→28` 是已用于提出候选的 discovery reference；真正用于检查复现性的
+7 个 extension pair 为 `1→2`、`3→4`、`7→8`、`8→9`、`9→10`、`22→23`、
+`23→24`。因为它们仍来自同一次序列采集，本轮是“预冻结模型形式的同会话
+复现审查”，不是独立采集上的外部泛化。
+
+7 个 extension pair 的 `delta CV-R2` 分别为 +0.00038、+0.00293、+0.01420、
++0.03316、+0.07020、-0.00012 和 -0.00361，中位数为 +0.00293。以 pair 为
+抽样单位的 10,000 次描述性 bootstrap 区间为 `[-0.00012, 0.03316]`，包含 0；
+去掉增益最大的 `9→10` 后，剩余 pair 的中位数仍为 +0.00165。这表明预测
+改善的方向不完全由一个 pair 驱动，但效应量小且区间跨过 0。
+
+没有任何 extension pair 同时通过预测和可辨识性门槛（0/7）。`3→4` 的参数
+可辨识性完整，但残差趋势 RMS 只降至 M1 的 67.4%，未达预设 50% 门槛。
+`7→8` 和 `9→10` 的预测指标较强，但四折 `tau` 均命中搜索下边界，因而数据
+没有在预定范围内识别出转折位置。斜率方向也未达一致性门槛：7 个 pair 中
+5 个下降、1 个上升、1 个折间方向不一致。
+
+discovery pair 也不再通过更严格的可辨识性审查：`5→6` 的高信号段支撑过窄且
+`alpha_high` 折间不稳定；`27→28` 的参数可辨识，但 source 外 RMSE 恶化
+5.67%。两个未检出对照都未通过；其中 `4→5` 虽出现 +0.102 的表面
+`delta CV-R2`，却同时伴随非物理斜率、病态设计矩阵和严重不足的动态范围，
+证明不能只依靠拟合改善判定 Mhinge。
+
+预冻结的整体判据中，只有“中位 `delta CV-R2` 为正”和“所有 leave-one-pair-out
+中位数为正”通过；“至少 5/7 pair 通过”、“bootstrap 下界大于 0”和“至少
+6/7 斜率方向一致”均未通过。因此 **Mhinge 不晋升为物理 M2**，当前数据
+只支持“部分 pair 的冻结条件均值存在非线性迹象”，不支持统一、可解释、可泛化的
+分段线性规律。机器结果位于 `outputs/mhinge_cross_pair_v1/`；新版本改变了冻结证据
+边界并扩展到 13 个 pair，所以保留旧 `pseudo_ghost_mechanism_v1` 作为前一阶段审计记录。
+
 ---
 
 ## 5. 真实 ground truth 仍是解除定量验证瓶颈的条件
