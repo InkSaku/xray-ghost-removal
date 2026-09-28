@@ -404,10 +404,15 @@ def render_diagnostics(
     pairs: list[PairData],
     predictions: dict[str, dict[str, np.ndarray]],
     comparisons: dict[str, Any],
+    *,
+    title: str = "Frozen observable Y: low-complexity intensity nonlinearity diagnostics",
 ) -> None:
     plt.rcParams["font.sans-serif"] = ["Arial", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
-    figure, axes = plt.subplots(len(pairs), 5, figsize=(20, 8), constrained_layout=True)
+    figure, axes = plt.subplots(
+        len(pairs), 5, figsize=(20, 4 * len(pairs)), constrained_layout=True,
+    )
+    axes = np.atleast_2d(axes)
     colors = {
         "M1": "#d95f02",
         "Mquad_diagnostic": "#7570b3",
@@ -502,10 +507,7 @@ def render_diagnostics(
             axis.set_ylabel("Block row")
             figure.colorbar(image, ax=axis, label="residual")
 
-    figure.suptitle(
-        "Frozen observable Y: low-complexity intensity nonlinearity diagnostics",
-        fontsize=14,
-    )
+    figure.suptitle(title, fontsize=14)
     figure.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(figure)
 

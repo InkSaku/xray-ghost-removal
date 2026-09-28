@@ -645,6 +645,96 @@ def background_spatial_oof(
     }
 
 
+def crossfit_observable_signal(
+    dark: np.ndarray,
+    fit_mask: np.ndarray,
+    folds: np.ndarray,
+    mode: str,
+    smoothness: float = 20.0,
+    darks: dict[int, np.ndarray] | None = None,
+    target_index: int | None = None,
+    contamination_supports: dict[int, np.ndarray] | None = None,
+    fixed_pattern: np.ndarray | None = None,
+    fixed_pattern_diagnostics: dict[str, Any] | None = None,
+    decomposition_iterations: int = FIXED_PATTERN_DECOMPOSITION_ITERATIONS,
+    huber_iterations: int = FIXED_PATTERN_HUBER_ITERATIONS,
+    huber_delta: float = HUBER_DELTA,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Build Y with a separate BG fit that excludes each block's spatial fold."""
+    if not (dark.shape == fit_mask.shape == folds.shape):
+        raise ValueError("dark, fit_mask, and folds must have the same shape")
+    background = np.full(dark.shape, np.nan, dtype=np.float64)
+    fold_rows = []
+    for fold in sorted(int(value) for value in np.unique(folds)):
+        train = fit_mask & (folds != fold) & np.isfinite(dark)
+        if mode == "loo_median":
+            if darks is None or target_index is None:
+                raise ValueError("loo_median cross-fitting requires darks and target_index")
+            centered_baseline = baseline(darks, target_index, "loo_median")
+            estimate = np.median(dark[train]) + centered_baseline
+        elif mode == "hybrid_spline":
+            if darks is None or target_index is None:
+                raise ValueError("hybrid_spline cross-fitting requires darks and target_index")
+            estimate, _ = estimate_hybrid_dark_background(
+                dark=dark,
+                darks=darks,
+                target_index=target_index,
+                fit_mask=train,
+                smoothness=smoothness,
+                huber_delta=huber_delta,
+            )
+        elif mode == "masked_hybrid_spline":
+            if darks is None or target_index is None or contamination_supports is None:
+                raise ValueError(
+                    "masked_hybrid_spline cross-fitting requires darks, target_index, "
+                    "and contamination_supports"
+                )
+            estimate, _ = estimate_masked_hybrid_dark_background(
+                dark=dark,
+                darks=darks,
+                contamination_supports=contamination_supports,
+                target_index=target_index,
+                fit_mask=train,
+                smoothness=smoothness,
+                fixed_pattern=fixed_pattern,
+                fixed_pattern_diagnostics=fixed_pattern_diagnostics,
+                decomposition_iterations=decomposition_iterations,
+                huber_iterations=huber_iterations,
+                huber_delta=huber_delta,
+            )
+        else:
+            estimate, _ = estimate_single_dark_background(
+                dark=dark,
+                fit_mask=train,
+                mode=mode,
+                smoothness=smoothness,
+                huber_delta=huber_delta,
+            )
+        test = folds == fold
+        background[test] = estimate[test]
+        heldout_air = fit_mask & test & np.isfinite(dark)
+        errors = dark[heldout_air].astype(np.float64) - estimate[heldout_air]
+        fold_rows.append({
+            "fold": fold,
+            "background_training_blocks": int(train.sum()),
+            "heldout_air_blocks": int(heldout_air.sum()),
+            "heldout_air_mae": float(np.mean(np.abs(errors))),
+            "heldout_air_bias": float(np.mean(errors)),
+        })
+    if not np.isfinite(background).all():
+        raise ValueError("Cross-fitted background did not cover every spatial fold")
+    signal = dark.astype(np.float64) - background
+    return signal, background, {
+        "definition": "Each block uses a BG fit that excluded its entire spatial fold",
+        "target_fold_dark_values_used_in_its_background_fit": False,
+        "folds": fold_rows,
+        "heldout_air_mae": float(np.average(
+            [row["heldout_air_mae"] for row in fold_rows],
+            weights=[row["heldout_air_blocks"] for row in fold_rows],
+        )),
+    }
+
+
 def extract_object_shape_templates(
     source_supports: list[np.ndarray],
     min_blocks: int = 20,
@@ -663,6 +753,89 @@ def extract_object_shape_templates(
             if min_blocks <= area <= maximum:
                 templates.append(component)
     return sorted(templates, key=lambda mask: int(mask.sum()))
+
+
+def realistic_occlusion_candidates(
+    source_supports: dict[int, np.ndarray],
+) -> list[dict[str, Any]]:
+    """Keep each real source mask at its full area, shape, and detector position."""
+    candidates = []
+    for light_index, support in sorted(source_supports.items()):
+        support = np.asarray(support, dtype=bool)
+        locations = np.argwhere(support)
+        if locations.size == 0:
+            candidates.append({
+                "label": f"light_{light_index}",
+                "status": "unverified",
+                "reason": "empty_source_support",
+                "requested_blocks": 0,
+                "requested_fraction": 0.0,
+            })
+            continue
+        row_min, column_min = locations.min(axis=0)
+        row_max, column_max = locations.max(axis=0) + 1
+        candidates.append({
+            "label": f"light_{light_index}",
+            "status": "candidate",
+            "shape": support[row_min:row_max, column_min:column_max].copy(),
+            "requested_top_left": [int(row_min), int(column_min)],
+            "requested_blocks": int(support.sum()),
+            "requested_fraction": float(support.mean()),
+            "bounding_box_blocks": [
+                int(row_max - row_min), int(column_max - column_min),
+            ],
+        })
+    return candidates
+
+
+def _place_realistic_occlusion(
+    candidate: dict[str, Any],
+    trusted_air: np.ndarray,
+) -> dict[str, Any]:
+    """Place a full real mask in trusted air, minimizing displacement from its origin."""
+    if candidate.get("status") == "unverified":
+        return {key: value for key, value in candidate.items() if key != "shape"}
+    shape = np.asarray(candidate["shape"], dtype=bool)
+    height, width = shape.shape
+    requested_row, requested_column = candidate["requested_top_left"]
+    base = {key: value for key, value in candidate.items() if key != "shape"}
+    if height > trusted_air.shape[0] or width > trusted_air.shape[1]:
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "bounding_box_larger_than_analysis_grid",
+        }
+
+    positions = [
+        (row, column)
+        for row in range(trusted_air.shape[0] - height + 1)
+        for column in range(trusted_air.shape[1] - width + 1)
+    ]
+    positions.sort(key=lambda position: (
+        (position[0] - requested_row) ** 2 + (position[1] - requested_column) ** 2,
+        abs(position[0] - requested_row) + abs(position[1] - requested_column),
+        position,
+    ))
+    for row, column in positions:
+        window = trusted_air[row:row + height, column:column + width]
+        if not np.all(window[shape]):
+            continue
+        mask = np.zeros_like(trusted_air, dtype=bool)
+        mask[row:row + height, column:column + width] = shape
+        displacement = float(np.hypot(row - requested_row, column - requested_column))
+        return {
+            **base,
+            "status": "validated",
+            "placement": "original" if displacement == 0 else "nearest_valid_translation",
+            "placed_top_left": [int(row), int(column)],
+            "displacement_blocks": displacement,
+            "mask": mask,
+        }
+    return {
+        **base,
+        "status": "unverified",
+        "reason": "full_shape_does_not_fit_inside_trusted_air",
+    }
 
 
 def _place_pseudo_occlusion(
@@ -778,7 +951,7 @@ def summarize_reconstruction_samples(samples: list[dict[str, Any]]) -> dict[str,
 
     by_kind = {
         kind: summarize([sample for sample in samples if sample["kind"] == kind])
-        for kind in ("square", "object_shape")
+        for kind in sorted({sample["kind"] for sample in samples})
     }
     def compare_mae(reference_mode: str) -> dict[str, Any]:
         comparisons = {}
@@ -821,6 +994,7 @@ def validate_background_reconstruction(
     square_sides: tuple[int, ...] = PSEUDO_OCCLUSION_SQUARE_SIDES,
     squares_per_size: int = PSEUDO_OCCLUSIONS_PER_SQUARE_SIZE,
     object_count: int = PSEUDO_OBJECT_OCCLUSION_COUNT,
+    realistic_candidates: list[dict[str, Any]] | None = None,
     contamination_supports: dict[int, np.ndarray] | None = None,
     masked_fixed_pattern: np.ndarray | None = None,
     masked_fixed_pattern_diagnostics: dict[str, Any] | None = None,
@@ -837,6 +1011,25 @@ def validate_background_reconstruction(
         squares_per_size=squares_per_size,
         object_count=object_count,
     )
+    realistic_attempts = [
+        _place_realistic_occlusion(candidate, trusted_air)
+        for candidate in (realistic_candidates or [])
+    ]
+    occlusions.extend(
+        {
+            "kind": "real_source_full_shape",
+            "size_label": attempt["label"],
+            "placement": attempt["placement"],
+            "mask": attempt["mask"],
+            "requested_blocks": attempt["requested_blocks"],
+            "requested_fraction": attempt["requested_fraction"],
+            "requested_top_left": attempt["requested_top_left"],
+            "placed_top_left": attempt["placed_top_left"],
+            "displacement_blocks": attempt["displacement_blocks"],
+        }
+        for attempt in realistic_attempts
+        if attempt["status"] == "validated"
+    )
     samples = []
     for occlusion in occlusions:
         holdout = occlusion["mask"]
@@ -848,6 +1041,12 @@ def validate_background_reconstruction(
             "holdout_blocks": int(holdout.sum()),
             "by_background": {},
         }
+        for key in (
+            "requested_blocks", "requested_fraction", "requested_top_left",
+            "placed_top_left", "displacement_blocks",
+        ):
+            if key in occlusion:
+                row[key] = occlusion[key]
         for mode in background_modes:
             if mode == "loo_median":
                 centered_baseline = baseline(darks, target_index, "loo_median")
@@ -899,6 +1098,16 @@ def validate_background_reconstruction(
         "requested_squares_per_size": squares_per_size,
         "requested_object_shapes": object_count,
         "generated_sample_count": len(samples),
+        "realistic_occlusion_attempts": [
+            {key: value for key, value in attempt.items() if key != "mask"}
+            for attempt in realistic_attempts
+        ],
+        "realistic_validated_count": int(sum(
+            attempt["status"] == "validated" for attempt in realistic_attempts
+        )),
+        "realistic_unverified_count": int(sum(
+            attempt["status"] == "unverified" for attempt in realistic_attempts
+        )),
         "summary": summarize_reconstruction_samples(samples),
         "samples": samples,
     }
@@ -1598,6 +1807,20 @@ def main() -> None:
         "--validate-background-reconstruction", action="store_true",
         help="Hide known air blocks with square and real-object shapes and score reconstruction",
     )
+    parser.add_argument(
+        "--validate-realistic-occlusions", action="store_true",
+        help=(
+            "Also attempt every full real source mask at its original or nearest valid "
+            "position; requires --validate-background-reconstruction"
+        ),
+    )
+    parser.add_argument(
+        "--end-to-end-background-oof", action="store_true",
+        help=(
+            "Refit BG after excluding each spatial test fold, then rerun the ghost fit "
+            "on the resulting cross-fitted observable signal"
+        ),
+    )
     parser.add_argument("--skip-input-hashes", action="store_true",
                         help="Skip SHA-256 provenance hashes for faster exploratory runs")
     parser.add_argument(
@@ -1628,6 +1851,10 @@ def main() -> None:
         parser.error(f"Non-summary runs must include the primary block size {PRIMARY_BLOCK}")
     if args.generate_sam_masks and args.source_mask_npz:
         parser.error("--generate-sam-masks and --source-mask-npz are mutually exclusive")
+    if args.validate_realistic_occlusions and not args.validate_background_reconstruction:
+        parser.error(
+            "--validate-realistic-occlusions requires --validate-background-reconstruction"
+        )
     frozen_background = None
     if args.frozen_background_config:
         frozen_background = validate_frozen_background_config(
@@ -1710,6 +1937,13 @@ def main() -> None:
         ])
         if args.validate_background_reconstruction else []
     )
+    full_shape_occlusion_candidates = (
+        realistic_occlusion_candidates({
+            index: source_block_masks[PRIMARY_BLOCK][index][1]
+            for index in sorted(source_light_indices)
+        })
+        if args.validate_realistic_occlusions else []
+    )
 
     input_paths = [data_dir / f"{index}-dark.dcm" for index in range(1, 32)]
     input_paths.extend(data_dir / f"{index}-light.dcm" for index in needed_lights)
@@ -1734,6 +1968,7 @@ def main() -> None:
             pair_dir.mkdir(parents=True, exist_ok=True)
         block_results = []
         primary_maps = None
+        primary_crossfit_maps = None
         reconstruction_validation = None
 
         for block in analysis_blocks:
@@ -1773,6 +2008,7 @@ def main() -> None:
                     target_index=dark_index,
                     background_modes=background_modes,
                     object_templates=object_shape_templates,
+                    realistic_candidates=full_shape_occlusion_candidates,
                     smoothness=args.spline_smoothness,
                     seed=RANDOM_SEED + dark_index * 1000 + 97,
                     contamination_supports=contamination_supports,
@@ -1785,6 +2021,7 @@ def main() -> None:
 
             background_results = []
             for background_mode in background_modes:
+                end_to_end_oof = None
                 if background_mode == "loo_median":
                     centered_baseline = baseline(darks, dark_index, "loo_median")
                     background = np.median(raw_dark) + centered_baseline
@@ -1880,10 +2117,56 @@ def main() -> None:
                             x, raw_dark, background, y, folds, fit,
                             background_fit_mask, source_support,
                         )
+                if block == PRIMARY_BLOCK and args.end_to_end_background_oof:
+                    crossfit_y, crossfit_background, crossfit_background_diagnostics = (
+                        crossfit_observable_signal(
+                            dark=raw_dark,
+                            fit_mask=background_fit_mask,
+                            folds=folds,
+                            mode=background_mode,
+                            smoothness=args.spline_smoothness,
+                            darks=darks,
+                            target_index=dark_index,
+                            contamination_supports=contamination_supports,
+                            fixed_pattern=masked_fixed_pattern,
+                            fixed_pattern_diagnostics=masked_fixed_pattern_diagnostics,
+                            decomposition_iterations=args.fixed_pattern_iterations,
+                            huber_iterations=args.fixed_pattern_huber_iterations,
+                            huber_delta=args.background_huber_delta,
+                        )
+                    )
+                    crossfit_fit, crossfit_null_rows, crossfit_null_summary = evaluate_with_nulls(
+                        x=x,
+                        y=crossfit_y,
+                        source_saturation=saturation_cache[block][light_index],
+                        mask_mode="all",
+                        folds=folds,
+                        future_sources=future_sources,
+                        seed=RANDOM_SEED + dark_index * 1000 + block,
+                    )
+                    end_to_end_oof = {
+                        "background": crossfit_background_diagnostics,
+                        "fit": (
+                            _compact_metric_view(crossfit_fit)
+                            if args.summary_only else _metric_view(crossfit_fit)
+                        ),
+                        "null_summary": crossfit_null_summary,
+                        "detection_gate": detection_gate(
+                            crossfit_fit, crossfit_null_rows, crossfit_null_summary,
+                        ),
+                    }
+                    if not args.summary_only:
+                        end_to_end_oof["null_detail"] = crossfit_null_rows
+                    if background_mode == args.primary_background:
+                        primary_crossfit_maps = (
+                            crossfit_y, crossfit_background, crossfit_fit,
+                        )
                 background_results.append({
                     "background_mode": background_mode,
                     "background_diagnostics": background_diagnostics,
                     "mask_results": mask_results,
+                    **({"end_to_end_background_oof": end_to_end_oof}
+                       if end_to_end_oof is not None else {}),
                 })
             block_results.append({
                 "block_size": block,
@@ -1915,22 +2198,34 @@ def main() -> None:
             if not args.skip_pair_figures:
                 render_six_panel(figure_path, pair_label, x, raw_dark,
                                  background, args.primary_background, y, primary_fit)
-            np.savez_compressed(
-                maps_path,
-                source=x.astype(np.float32),
-                raw_dark=raw_dark.astype(np.float32),
-                background=background.astype(np.float32),
-                background_mode=np.asarray(args.primary_background),
-                background_fit_mask=background_fit_mask,
-                source_support=source_support,
-                source_saturation_fraction=(
+            map_arrays = {
+                "source": x.astype(np.float32),
+                "raw_dark": raw_dark.astype(np.float32),
+                "background": background.astype(np.float32),
+                "background_mode": np.asarray(args.primary_background),
+                "background_fit_mask": background_fit_mask,
+                "source_support": source_support,
+                "source_saturation_fraction": (
                     saturation_cache[PRIMARY_BLOCK][light_index].astype(np.float32)
                 ),
-                observable_signal=y.astype(np.float32),
-                oof_prediction=primary_fit["prediction"].astype(np.float32),
-                oof_residual=primary_fit["residual"].astype(np.float32),
-                evaluated_mask=primary_fit["evaluated_mask"],
-                spatial_folds=folds,
+                "observable_signal": y.astype(np.float32),
+                "oof_prediction": primary_fit["prediction"].astype(np.float32),
+                "oof_residual": primary_fit["residual"].astype(np.float32),
+                "evaluated_mask": primary_fit["evaluated_mask"],
+                "spatial_folds": folds,
+            }
+            if primary_crossfit_maps is not None:
+                crossfit_y, crossfit_background, crossfit_fit = primary_crossfit_maps
+                map_arrays.update({
+                    "crossfit_background": crossfit_background.astype(np.float32),
+                    "crossfit_observable_signal": crossfit_y.astype(np.float32),
+                    "crossfit_oof_prediction": crossfit_fit["prediction"].astype(np.float32),
+                    "crossfit_oof_residual": crossfit_fit["residual"].astype(np.float32),
+                    "crossfit_evaluated_mask": crossfit_fit["evaluated_mask"],
+                })
+            np.savez_compressed(
+                maps_path,
+                **map_arrays,
             )
             pair_result["primary_maps"] = str(maps_path.resolve())
             pair_result["output_artifacts"] = {
@@ -1953,7 +2248,7 @@ def main() -> None:
         if args.validate_background_reconstruction else None
     )
     result = {
-        "schema_version": 5,
+        "schema_version": 6,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "study_question": "Can detectable previous-exposure structure in a later dark acquisition be explained by a low-dimensional linear spatial model?",
         "evidence_boundary": [
@@ -1994,12 +2289,15 @@ def main() -> None:
                 "extra_mask_fallback": "Otsu when an external archive lacks a light index",
             },
             "background_spatial_oof": not args.skip_background_oof,
+            "end_to_end_background_oof": args.end_to_end_background_oof,
             "background_reconstruction_validation": {
                 "enabled": args.validate_background_reconstruction,
                 "square_sides_blocks": list(PSEUDO_OCCLUSION_SQUARE_SIDES),
                 "squares_per_size": PSEUDO_OCCLUSIONS_PER_SQUARE_SIZE,
                 "object_shape_count": PSEUDO_OBJECT_OCCLUSION_COUNT,
                 "object_template_count": len(object_shape_templates),
+                "full_shape_candidate_count": len(full_shape_occlusion_candidates),
+                "full_shape_validation_enabled": args.validate_realistic_occlusions,
                 "target_values_hidden_from_single-dark_fit": True,
                 "loo_level_anchor_uses_training_air_only": True,
             },

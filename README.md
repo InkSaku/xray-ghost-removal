@@ -3,21 +3,25 @@
 去除连续计算机放射成像（Computed Radiography，CR）图像中的残影（残留/余辉）伪影。
 当擦除周期不完整时，计算机放射成像板会保留上一次曝光留下的微弱潜像，因此图像 `t` 中会带有图像 `t-1` 的一个缩放副本。本项目包含针对该问题的代码、设计文档以及当前研究结果。
 
-## 当前状态 — 2026-09-21
+## 当前状态 — 2026-09-28
+
+2026-09-28 补做 `3→4` 与 `5→6` 的双向 M1 迁移：直接迁移能预测大部分冻结 `Y` 的
+空间变化，但目标图 12.5% 区域校准后误差进一步下降；详情与证据边界见
+`RESULTS.md` §4.17。这是同会话伪标签的探索性比较，不是独立采集的真实去除验证。
 
 30 帧连续序列上的线性残影现象仍然成立，但现有去除器只在强残影样本上显示出明确改善，缺少 ground truth 的问题尚未解决。
 
-62 张 dark/light 图像的前三阶段稳健性分析已经完成。拍摄顺序支持把 `light_(N-1) → dark_N` 作为因果候选配对，但 30 组中只有 5 组在 24 种分析设置下得到稳健确认，21 组对基线、饱和掩膜或分块大小敏感，4 组未检出；另有 17/30 张 dark 图像支持多帧记忆效应。因此，这批 dark 图像不能整批作为 clean reference，也不能把“未检出”直接解释为“无残影”。
+62 张 dark/light 图像的前三阶段稳健性分析已经完成。拍摄顺序支持把 `light_(N-1) → dark_N` 作为因果候选配对，但 30 组中只有 5 组在 24 种分析设置下得到稳健确认，21 组对基线、饱和掩膜或分块大小敏感，4 组未检出。这批 dark 图像不能整批作为 clean reference，也不能把“未检出”直接解释为“无残影”。项目后续研究范围已固定为紧邻前一帧造成的单帧残影；早期多阶结果只作为历史记录，不继续建模或扩展。
 
 正式 pseudo-ghost 机制实验不使用 `dark ≈ ghost` 的简化，而是定义 `Y_t = D_t - estimated_background_t`，并对 `5→6`、`27→28` 生成严格四折空间 OOF 预测。冻结 `masked_hybrid_spline` BG 和 16×16 block-mean 网格下，M1 的 OOF CV-R² 分别为 0.9603 和 0.9228；但 residual 邻域相关仍高达 0.858 和 0.963，因此剩余部分明显不是随机噪声。
 
-背景估计使用 `masked_hybrid_spline`：它用前序 light 物体掩膜排除可能的残影污染，分解每帧平滑漂移，再用加权 Huber 均值估计固定图样 `F`，不再对 dark stack 逐位置取中位数。2026-09-21 的 9 组预设参数扰动全部通过 BG freeze gate：核心阳性和未检出对照均 9/9 稳定，核心 alpha 最大变化 3.19%，nominal 伪遮挡在 13/13 pair 上优于旧 hybrid。同日的空间可识别性审查进一步证明，核心 source 区没有零覆盖 block，排除低覆盖 block 后 detection 不翻转、alpha 变化不超过 0.11%。因此已冻结 `configs/background_frozen_v1.json` 中的 SAM-based BG，后续工作转入 `M1 -> M2 -> M3`；线性 M1 本身没有在本次审计中改动。
+背景估计使用 `masked_hybrid_spline`：它用前序 light 物体掩膜排除可能的残影污染，分解每帧平滑漂移，再用加权 Huber 均值估计固定图样 `F`，不再对 dark stack 逐位置取中位数。2026-09-21 的参数与固定图样覆盖审查支持冻结 SAM-based BG。2026-09-22 进一步对每个空间测试折重新估计 BG：核心 pair 的 alpha 最大变化 0.42%，M0/M1/Mhinge 的预测排名在 13/13 pair 中不变。不过完整真实形状的 169 次已知空气区尝试只有 58 次能放下，且没有一次位于原探测器位置；占图 19.94%–57.83% 的大物体仍未验证。因此冻结方案适合作为当前比较基线，不能当作真实 BG ground truth。
 
 同日完成的强度非线性诊断没有产生正式 M2：预设主候选 Msat 在两个 pair 都未通过且 `S0` 四折全部命中搜索上边界。随后的 Mhinge 跨 pair 预冻结复现审查也未通过：7 个未参与候选提出的 extension pair 中 0 个同时通过预测和可辨识性门槛。其 `delta CV-R2` 中位数为 +0.00293，pair-bootstrap 95% 描述性区间为 `[-0.00012, 0.03316]`；斜率方向也未达 6/7 一致性门槛。因此当前证据只说明部分 pair 的冻结 `E[Y|X]` 有非线性迹象，不支持统一的 Mhinge 规律，更不能写成 alpha 已被证明随入射曝光变化。
 
 M1 后的首轮候选机制比较已完成。Mblur 通过嵌套空间交叉验证在四个外层折中均选择 `σ=0` block，因此当前数据不支持高斯空间扩散作为 M2。只用于诊断的 Mquad 将 `27→28` 的 OOF CV-R² 从 0.9228 提高到 0.9647、RMSE 从 4.217 降到 2.851，但预设的两个残差趋势门槛只通过一个，所以尚未晋升为正式 M2。未拟合组合模型。
 
-全部 62 张 DICOM 均缺少 `AcquisitionTime`。`InstanceCreationTime` 只用于审计，未进入配对、拟合、标签或物理解释，所以当前结果不能估计余辉半衰期或真实时间衰减。当前最高价值的代码工作是只基于已记录的 kV、mA、曝光时长和 mAs 做曝光关联分析；最终定量验证和监督训练仍需要按采集协议获得真实 `clean / previous / ghosted` 三元组。引用数字前请先阅读 `RESULTS.md`。
+单帧曝光关联分析已在冻结的 13-pair 队列上完成。mAs 与 alpha 的 Spearman `rho=0.108`，与 OOF 预测残影对比度的 `rho=0.283`，且逐一删除样本后的方向或幅度不稳定。4 组完全相同的曝光设置中，3 组的 alpha 最大/最小比达到 32.3、50.1 和 33.7。固定 3×3 探测器区域的诊断中，10/10 个支撑充足区域保持相同强弱顺序，但严格满足局部预测可靠性的只有两组中的 4 个区域，4/4 保持顺序；第三组没有可靠共同区域。最清楚的 `1→2 / 2→3` 重复组具有几乎相同的 source 强度、面积和位置，两个可靠共同区域的 alpha 仍相差 28.5 和 33.7 倍。结果更像未记录的板/擦除/读取全局状态，但 DICOM 中缺少验证该解释的技术字段。因此当前数据不支持仅用 kV、mA、曝光时长或 mAs 预测单帧残影。全部 62 张 DICOM 均缺少 `AcquisitionTime`，所以仍不能估计余辉半衰期或真实时间衰减。最终定量验证需要按采集协议获得真实 `clean / previous / ghosted` 三元组。引用数字前请先阅读 `RESULTS.md`。
 
 ---
 
@@ -26,7 +30,7 @@ M1 后的首轮候选机制比较已完成。Mblur 通过嵌套空间交叉验�
 观测图像是真实曝光图像与前序图像缩放副本的线性叠加。
 
 ```
-I_t(x) = S_t(x) + sum_k alpha_k * (I_{t-k}(x) - bg_{t-k})
+I_t(x) = S_t(x) + alpha * (I_{t-1}(x) - bg_{t-1})
 ```
 
 `alpha` 是残影耦合系数。在 30 帧初步序列中，对于 11 对存在可测残影的相邻图像，`alpha` 的中位数为 0.0040，在残影最强的图像中升至 0.0095。因此，残影所携带的信号远低于上一张图像信号的 1%，这使它接近逐像素噪声底，因而“如何将残影与噪声分离”成为本项目的核心困难。经过空间平均后，残影十分明显，分块 R² 最高可达到 0.584；但在逐像素层面并非如此，R² 约为 0.013。完整数据表见 `RESULTS.md`。
@@ -47,8 +51,10 @@ I_t(x) = S_t(x) + sum_k alpha_k * (I_{t-k}(x) - bg_{t-k})
 | `scripts/analyze_pseudo_ghost_mechanism.py` | 对可观测残影信号生成严格空间 OOF 预测、null 对照、背景重建验证和污染感知 `F` 估计 | 已完成 13 组 single-lag 背景比较；不把 dark 当作 clean ground truth |
 | `scripts/analyze_intensity_nonlinearity.py` | 在冻结的 `X/Y/BG/fold` 上比较 M1、Mquad、Msat、Mhinge 与低自由度样条 | 探索性条件均值诊断；不把 `X` 当入射剂量，不自动晋升 M2 |
 | `scripts/audit_mhinge_cross_pair.py` | 在 13 个预声明 pair 上独立比较 M1/Mhinge，审查 `tau`、斜率、动态范围和 pair-level 稳健性 | 7 个 extension pair 中 0 个通过全部门槛；Mhinge 不晋升 M2 |
+| `scripts/analyze_single_frame_exposure.py` | 在冻结 13-pair 输入上比较单帧 alpha、OOF 残影对比度与曝光参数，并审查完全相同设置的重复样本 | 曝光参数单独解释不了 pair 间差异；稳定覆盖一个 JSON 和一张汇总图 |
 | `scripts/audit_background_freeze.py` | 固定 13 组队列的 BG 参数敏感性、pair 级伪遮挡 bootstrap 和 source-aligned residual 审计 | 9 组正式扰动全部通过，SAM-based BG v1 已冻结 |
-| `scripts/audit_fixed_pattern_identifiability.py` | 审查冻结 `F` 的空间覆盖、有效样本数和低覆盖排除敏感性 | 空间可识别性通过，BG 收尾完成 |
+| `scripts/audit_background_crossfit.py` | 用完整真实物体形状审查 BG 插补，并对每个空间测试折重算 BG 后复核 alpha 与 M0/M1/Mhinge 排名 | 核心 alpha 与模型排名稳定；大物体和原位置 BG 仍未验证 |
+| `scripts/audit_fixed_pattern_identifiability.py` | 审查冻结 `F` 的空间覆盖、有效样本数和低覆盖排除敏感性 | 空间覆盖与低覆盖排除审查通过 |
 | `scripts/analyze_frozen_candidates.py` | 只读取冻结 NPZ，以嵌套空间 CV 比较 Mblur，并执行 OOF 二次诊断 | Mblur 未获支持；Mquad 仅保留为诊断证据 |
 
 ---
@@ -128,9 +134,21 @@ python scripts/analyze_frozen_candidates.py
 # 完整命令与判据见 docs/plans/2026-09-21-mhinge-cross-pair-audit.md。
 python scripts/audit_mhinge_cross_pair.py
 
+# 只读取同一 13-pair 冻结输入，分析单帧残影与曝光参数的关联。
+# 重跑时原地覆盖一个 JSON 和一张图，不创建新的轮次目录。
+python scripts/analyze_single_frame_exposure.py
+
+# 在冻结的 3→4、5→6 block16 数据上做双向 M1 迁移和少量目标校准。
+# 稳定覆盖 outputs/pair_transfer_v1/ 中的一个 JSON 和一张诊断图。
+python scripts/analyze_pair_transfer.py
+
 # 复核冻结固定图样 F 的原始覆盖、最终权重有效覆盖，
 # 以及排除低覆盖 block 后线性结论是否稳定。
 python scripts/audit_fixed_pattern_identifiability.py
+
+# 用完整真实物体形状做已知空气区遮挡，并逐空间折重算 BG；
+# 中间 NPZ 写入系统临时目录，最终只覆盖现有 BG 审计目录中的两个固定文件。
+python scripts/audit_background_crossfit.py
 
 # 在整个序列上运行基于扩散修补的基线方法。
 python scripts/run_physics_baseline.py --n-previous 5
@@ -167,9 +185,9 @@ python scripts/diagnose_model.py --device cuda
 - 大多数图像没有真实标签，因此无法用 PSNR 或 SSIM 评估去除质量。目前的验证方式是人工视觉判断加“相干残影抑制”指标。
 - `src/evaluation/` 和 `src/training/` 是空包。指标计算与训练循环都直接写在 `scripts/train_unet.py` 中。
 - 超参数通过命令行参数设置，而不是 YAML 配置文件。
-- dark/light 分析只验证了序列中的空间相关与多帧记忆，没有证明任何 dark 图像是 clean reference，也没有产生监督训练标签。
-- 62 张 dark/light DICOM 没有 `AcquisitionTime`；`InstanceCreationTime` 不足以支持物理时间衰减建模。曝光关联分析尚未执行。
-- 多阶模型需要在共同全图域上使用观测 DICOM 值；当 light 图像发生截断饱和时，lag 系数可能有偏。
+- dark/light 分析只验证了单帧候选关系中的空间相关，没有证明任何 dark 图像是 clean reference，也没有产生监督训练标签。
+- 62 张 dark/light DICOM 没有 `AcquisitionTime`；`InstanceCreationTime` 不足以支持物理时间衰减建模。现有曝光关联是同一会话内的描述性结果，不能建立剂量定律。
+- 完整物体 BG 验证只能在已知空气区进行；现有数据无法在真实物体原位置给出 clean BG，也无法安放占图约 20%–58% 的大物体形状。
 - `outputs/dark_light_analysis_20260913/` 保存本地可复现结果，并由 `.gitignore` 排除。不要用强制添加把工作簿、JSON 或临时诊断产物提交到 Git。
 - dark/light 默认输出目录沿用 `20260913` 这一历史名称；真实运行时间以 JSON 的 `generated_at` 为准，不要从目录名推断。
 - `RESULTS.md` 第 1 节和第 2 节记录了两处命名/标签不一致问题。它们都不会改变任何结果，但会误导代码阅读者。

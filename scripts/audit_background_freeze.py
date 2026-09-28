@@ -18,7 +18,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 CORE_PAIRS = ("5->6", "27->28")
@@ -354,6 +358,174 @@ def render_markdown(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def extract_loo_comparison(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Extract paired holdout errors for masked hybrid versus LOO median."""
+    pair_rows = []
+    all_samples = []
+    for pair in analysis["pair_results"]:
+        label = f"{pair['light_index']}->{pair['dark_index']}"
+        samples = []
+        for sample in pair["background_reconstruction_validation"]["samples"]:
+            by_background = sample["by_background"]
+            loo_mae = float(by_background["loo_median"]["mae"])
+            masked_mae = float(by_background["masked_hybrid_spline"]["mae"])
+            row = {
+                "pair": label,
+                "kind": sample["kind"],
+                "loo_mae": loo_mae,
+                "masked_mae": masked_mae,
+                "delta_mae": masked_mae - loo_mae,
+            }
+            samples.append(row)
+            all_samples.append(row)
+        pair_rows.append({
+            "pair": label,
+            "samples": samples,
+            "median_delta_mae": float(np.median([row["delta_mae"] for row in samples])),
+        })
+    pair_medians = [row["median_delta_mae"] for row in pair_rows]
+    return {
+        "pairs": pair_rows,
+        "samples": all_samples,
+        "sample_count": len(all_samples),
+        "improved_sample_count": int(sum(row["delta_mae"] < 0 for row in all_samples)),
+        "improved_pair_count": int(sum(value < 0 for value in pair_medians)),
+        "pair_median_delta_mae": bootstrap_median(pair_medians, RANDOM_SEED),
+        "loo_median_mae": float(np.median([row["loo_mae"] for row in all_samples])),
+        "masked_median_mae": float(np.median([
+            row["masked_mae"] for row in all_samples
+        ])),
+    }
+
+
+def render_pseudo_occlusion_evidence(analysis: dict[str, Any], output: Path) -> None:
+    """Render masked-hybrid versus LOO-median pseudo-occlusion evidence."""
+    comparison = extract_loo_comparison(analysis)
+    samples = comparison["samples"]
+    pairs = comparison["pairs"]
+    blue = "#4C72B0"
+    orange = "#DD8452"
+    dark = "#262626"
+    kind_style = {
+        "square": (blue, "o", "Square holdout"),
+        "object_shape": (orange, "^", "Object-shaped holdout"),
+    }
+
+    with plt.rc_context({
+        "font.sans-serif": ["Arial", "DejaVu Sans"],
+        "axes.unicode_minus": False,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+    }):
+        figure, (scatter_axis, delta_axis) = plt.subplots(
+            1, 2, figsize=(14.5, 5.5), gridspec_kw={"width_ratios": (1.0, 1.35)},
+        )
+
+        for kind in ("square", "object_shape"):
+            rows = [row for row in samples if row["kind"] == kind]
+            if not rows:
+                continue
+            color, marker, label = kind_style[kind]
+            scatter_axis.scatter(
+                [row["loo_mae"] for row in rows],
+                [row["masked_mae"] for row in rows],
+                s=30, marker=marker, color=color, alpha=0.78,
+                edgecolor="white", linewidth=0.4, label=label,
+            )
+        paired_values = np.asarray([
+            value for row in samples for value in (row["loo_mae"], row["masked_mae"])
+        ])
+        lower = max(float(paired_values.min()) * 0.80, 1e-6)
+        upper = float(paired_values.max()) * 1.20
+        scatter_axis.plot([lower, upper], [lower, upper], color=dark, linewidth=1.0)
+        scatter_axis.set_xlim(lower, upper)
+        scatter_axis.set_ylim(lower, upper)
+        scatter_axis.set_xscale("log")
+        scatter_axis.set_yscale("log")
+        scatter_axis.set_aspect("equal", adjustable="box")
+        scatter_axis.set_xlabel("LOO median MAE")
+        scatter_axis.set_ylabel("Masked hybrid spline MAE")
+        scatter_axis.set_title("(a) Paired holdout errors")
+        scatter_axis.legend(frameon=False, fontsize=8, loc="upper left")
+        scatter_axis.text(
+            0.97, 0.04,
+            f"{comparison['improved_sample_count']}/{comparison['sample_count']} below identity",
+            transform=scatter_axis.transAxes, ha="right", va="bottom", fontsize=9,
+        )
+
+        positions = np.arange(len(pairs))
+        pair_medians = np.asarray([row["median_delta_mae"] for row in pairs])
+        delta_axis.hlines(
+            positions, pair_medians, 0, color="#B8C9DE", linewidth=2.0, zorder=1,
+        )
+        delta_axis.scatter(pair_medians, positions, s=38, color=blue, zorder=2)
+        delta_axis.axvline(0, color=dark, linewidth=1.0)
+        delta_axis.set_yticks(positions, [row["pair"] for row in pairs])
+        delta_axis.invert_yaxis()
+        delta_axis.set_xlim(float(pair_medians.min()) * 1.08, max(0.1, float(-pair_medians.min()) * 0.03))
+        delta_axis.set_xlabel(r"Pair median $Δ$MAE (masked hybrid spline $-$ LOO median)")
+        delta_axis.set_ylabel("Light→dark pair")
+        delta_axis.set_title("(b) Median paired difference by acquisition pair")
+        aggregate = comparison["pair_median_delta_mae"]
+        delta_axis.text(
+            0.02, 0.03,
+            f"Pair median = {aggregate['median']:.3f}  "
+            f"[95% CI {aggregate['ci025']:.3f}, {aggregate['ci975']:.3f}]",
+            transform=delta_axis.transAxes, ha="left", va="bottom", fontsize=9,
+        )
+
+        for axis in (scatter_axis, delta_axis):
+            axis.grid(alpha=0.20)
+            axis.tick_params(labelsize=9)
+        figure.suptitle(
+            "Pseudo-occlusion reconstruction: masked hybrid spline vs LOO median",
+            fontsize=14,
+        )
+        figure.tight_layout(rect=(0, 0, 1, 0.95), w_pad=3.0)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=300, bbox_inches="tight")
+        plt.close(figure)
+
+
+def run_loo_comparison(
+    repo_root: Path,
+    data_dir: Path,
+    mask_archive: Path,
+) -> dict[str, Any]:
+    """Run only the frozen nominal LOO-versus-masked reconstruction comparison."""
+    with tempfile.TemporaryDirectory(prefix="xray-bg-loo-evidence-") as temporary:
+        output_dir = Path(temporary) / "analysis"
+        command = [
+            sys.executable,
+            str(repo_root / "scripts" / "analyze_pseudo_ghost_mechanism.py"),
+            "--data-dir", str(data_dir),
+            "--output-dir", str(output_dir),
+            "--pairs", "single-lag",
+            "--summary-only",
+            "--background-modes", "loo_median,masked_hybrid_spline",
+            "--primary-background", "masked_hybrid_spline",
+            "--source-mask-npz", str(mask_archive),
+            "--mask-dilation-pixels", str(NOMINAL_CONFIG["mask_dilation_pixels"]),
+            "--spline-smoothness", str(NOMINAL_CONFIG["spline_smoothness"]),
+            "--background-huber-delta", str(NOMINAL_CONFIG["huber_delta"]),
+            "--fixed-pattern-iterations", str(NOMINAL_CONFIG["fixed_pattern_iterations"]),
+            "--fixed-pattern-huber-iterations",
+            str(NOMINAL_CONFIG["fixed_pattern_huber_iterations"]),
+            "--skip-background-oof",
+            "--skip-input-hashes",
+            "--validate-background-reconstruction",
+        ]
+        completed = subprocess.run(
+            command, cwd=repo_root, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("LOO comparison failed:\n" + completed.stdout[-8000:])
+        return json.loads(
+            (output_dir / "analysis_results.json").read_text(encoding="utf-8")
+        )
+
+
 def run_configuration(
     repo_root: Path,
     output_root: Path,
@@ -419,6 +591,13 @@ def main() -> None:
         "--keep-runs", action="store_true",
         help="Keep per-configuration intermediate runs; default uses a temporary directory",
     )
+    parser.add_argument(
+        "--render-loo-comparison", action="store_true",
+        help=(
+            "Rerun only the frozen nominal masked-hybrid-versus-LOO reconstruction "
+            "comparison in a temporary directory and overwrite the evidence PNG"
+        ),
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -436,6 +615,18 @@ def main() -> None:
     if not mask_archive.exists():
         raise FileNotFoundError(mask_archive)
     output_root.mkdir(parents=True, exist_ok=True)
+    if args.render_loo_comparison:
+        figure_path = output_root / "pseudo_occlusion_evidence.png"
+        analysis = run_loo_comparison(repo_root, data_dir, mask_archive)
+        render_pseudo_occlusion_evidence(analysis, figure_path)
+        comparison = extract_loo_comparison(analysis)
+        print(json.dumps({
+            "comparison": "masked_hybrid_spline_vs_loo_median",
+            "improved_samples": comparison["improved_sample_count"],
+            "sample_count": comparison["sample_count"],
+            "figure": str(figure_path),
+        }, ensure_ascii=False, indent=2))
+        return
 
     configurations = [resolved_config(row) for row in SENSITIVITY_CONFIGS]
 

@@ -9,6 +9,7 @@ import pytest
 
 from scripts.analyze_pseudo_ghost_mechanism import (
     background_spatial_oof,
+    crossfit_observable_signal,
     detection_gate,
     estimate_hybrid_dark_background,
     estimate_masked_hybrid_dark_background,
@@ -16,6 +17,7 @@ from scripts.analyze_pseudo_ghost_mechanism import (
     generate_pseudo_occlusions,
     parse_block_sizes,
     parse_pairs,
+    realistic_occlusion_candidates,
     single_lag_stratum,
     strict_affine_oof,
     validate_frozen_background_config,
@@ -250,6 +252,28 @@ def test_background_spatial_oof_never_needs_excluded_source_values():
     assert metrics["mae"] < 1e-6
 
 
+def test_crossfit_background_does_not_use_heldout_fold_dark_values():
+    height, width = 48, 52
+    yy, xx = np.mgrid[-1:1:complex(height), -1:1:complex(width)]
+    dark = 800.0 + 18.0 * xx + 9.0 * yy + 4.0 * xx * yy
+    folds = spatial_folds(dark.shape)
+    fit_mask = np.ones_like(dark, dtype=bool)
+
+    _, original_background, diagnostics = crossfit_observable_signal(
+        dark, fit_mask, folds, "poly2",
+    )
+    changed = dark.copy()
+    changed[folds == 0] += 10000.0
+    _, changed_background, _ = crossfit_observable_signal(
+        changed, fit_mask, folds, "poly2",
+    )
+
+    assert diagnostics["target_fold_dark_values_used_in_its_background_fit"] is False
+    assert np.allclose(
+        original_background[folds == 0], changed_background[folds == 0], atol=1e-6,
+    )
+
+
 def test_pseudo_occlusions_stay_inside_trusted_air():
     trusted_air = np.ones((64, 64), dtype=bool)
     trusted_air[20:35, 24:40] = False
@@ -268,6 +292,39 @@ def test_pseudo_occlusions_stay_inside_trusted_air():
 
     assert {row["kind"] for row in samples} == {"square", "object_shape"}
     assert all(np.all(trusted_air[row["mask"]]) for row in samples)
+
+
+def test_full_real_shape_is_kept_or_reported_unverified():
+    support = np.zeros((32, 32), dtype=bool)
+    support[8:24, 6:26] = True
+    candidates = realistic_occlusion_candidates({7: support})
+    trusted_air = np.ones_like(support)
+    trusted_air[8:24, 6:26] = False
+
+    result = validate_background_reconstruction(
+        dark=np.ones((32, 32), dtype=float),
+        trusted_air=trusted_air,
+        darks={2: np.ones((32, 32), dtype=float)},
+        target_index=2,
+        background_modes=("poly2",),
+        object_templates=[],
+        realistic_candidates=candidates,
+        smoothness=20.0,
+        seed=31,
+        square_sides=(),
+        object_count=0,
+    )
+
+    attempts = result["realistic_occlusion_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["requested_blocks"] == int(support.sum())
+    if attempts[0]["status"] == "validated":
+        sample = result["samples"][0]
+        assert sample["kind"] == "real_source_full_shape"
+        assert sample["holdout_blocks"] == int(support.sum())
+    else:
+        assert attempts[0]["status"] == "unverified"
+        assert result["generated_sample_count"] == 0
 
 
 def test_pseudo_occlusion_validation_recovers_known_quadratic_background():
