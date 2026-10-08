@@ -192,3 +192,11 @@ python scripts/diagnose_model.py --device cuda
 - dark/light 默认输出目录沿用 `20260913` 这一历史名称；真实运行时间以 JSON 的 `generated_at` 为准，不要从目录名推断。
 - `RESULTS.md` 第 1 节和第 2 节记录了两处命名/标签不一致问题。它们都不会改变任何结果，但会误导代码阅读者。
 - 仓库中没有包含已训练的 U-Net checkpoint。由于基于合成数据训练的模型无法迁移到真实数据，因此后续计划是在真实配对数据上重新训练。
+
+## DICOM 阅片与噪声/截断检查
+
+运行 `.venv/bin/python scripts/prepare_dicom_review.py`，在稳定路径
+`outputs/dicom_review/` 生成原图查看副本、单帧 seamless 处理后的 DICOM、共享窗口
+对照图和检查表。该阅片包用于检查早期全分辨率去除器，不代表冻结 M1 的恢复验证。
+详细定义、来源 UID 修复、输出保留规则及局限见
+[阅片计划](docs/plans/2026-09-30-dicom-review.md)。

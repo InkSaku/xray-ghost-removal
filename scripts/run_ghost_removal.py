@@ -83,7 +83,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="data/processed/seamless_cleaned")
     parser.add_argument("--figures-dir", type=str, default="results/figures/seamless_cleaned")
     parser.add_argument("--indices", type=str, default=None, help="e.g. '4,6,18'; default all")
-    parser.add_argument("--n-previous", type=int, default=3, help="ghost layers to peel off")
+    parser.add_argument("--n-previous", type=int, default=1, help="previous frames (default: nearest only)")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)

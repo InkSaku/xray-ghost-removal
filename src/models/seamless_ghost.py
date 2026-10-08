@@ -45,6 +45,7 @@ def remove_ghost_seamless(
     apply_taper_sigma: float = 4.0,
     min_clean_air: float = 0.02,
     min_ghost_zone: float = 0.002,
+    clip_output: bool = True,
 ) -> SeamlessResult:
     """Remove the ghost of `previous` from `current` seamlessly.
 
@@ -111,10 +112,9 @@ def remove_ghost_seamless(
 
     correction = exp_lf - cur_lf
 
-    # SAFETY: only correct FLAT background. Protect any real structure/texture
-    # in the current image (the object, its edges, fine detail). A ghost that
-    # overlaps the real object cannot be removed without corrupting the object,
-    # so we leave those regions untouched.
+    # Use low-frequency replacement only in flat air. Other regions use the
+    # estimated template subtraction below; real-structure preservation there
+    # is an unverified assumption, not a protection guarantee.
     local_mean = gaussian_filter(current, 6.0)
     local_var = gaussian_filter(current ** 2, 6.0) - local_mean ** 2
     local_std = np.sqrt(np.maximum(local_var, 0))
@@ -126,11 +126,12 @@ def remove_ghost_seamless(
     apply_mask = np.clip(gaussian_filter(apply_region.astype(np.float64), apply_taper_sigma), 0, 1)
 
     # Flat background: seamless inpainting (preserves noise, no halo).
-    # Structured/object regions: subtract the calibrated ghost so overlaps
-    # are removed without corrupting the object.
+    # Structured/object regions: subtract the calibrated template. A biased
+    # alpha or saturated source can alter true structure in these regions.
     ghost_est = alpha * (previous - bg_level)
     cleaned = current + correction * apply_mask - ghost_est * (1.0 - apply_mask)
-    cleaned = np.clip(cleaned, 0, np.iinfo(np.uint16).max)
+    if clip_output:
+        cleaned = np.clip(cleaned, 0, np.iinfo(np.uint16).max)
 
     return SeamlessResult(cleaned, True, f"applied (alpha={alpha:.4f})", gz_frac, ca_frac)
 
