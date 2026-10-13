@@ -1,7 +1,7 @@
-"""Reproducible full-resolution, single-lag seamless review (not frozen M1).
+"""Export frozen M1 OOF corrections as full-size research DICOMs.
 
-Select the cohort using inputs only, then export SC review copies and diagnostics.
-No ground truth: noise/edge measurements are proxies, never accuracy claims.
+Each frozen block prediction is subtracted from its corresponding 16x16 pixels.
+No refitting, interpolation, background subtraction, or seamless inpainting.
 """
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ from scipy.ndimage import binary_erosion, gaussian_filter
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.models.physics_model import detect_air_mask, detect_object_mask
-from src.models.seamless_ghost import remove_ghost_seamless
 from src.utils.dicom_utils import save_dicom
 
-RAW = ROOT / 'data/raw/残影图像'
+RAW = ROOT / 'data/raw/AI修残影例图'
 OUT = ROOT / 'outputs/dicom_review'
 
 
@@ -149,148 +148,183 @@ def preview(idx, before, after, roi, windows, output):
     plt.close(fig)
 
 
-def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    rows = screen_inputs()
-    cohort = select_cohort(rows)
-    # Freeze selection before running the remover. Never select on improvement.
-    manifest = dict(method='seamless, nearest previous frame only, default parameters; clip_output=False',
-                    not_frozen_M1=True, input_screen=rows,
-                    cohort={str(k): v for k, v in sorted(cohort.items())},
-                    selection_policy='Historical 4/6/18 + unchanged 1 + observed-maximum pile-up extrema (>0.1%) + weakest input association excluding pile-up',
-                    limitations=['No clean ground truth', 'Endpoint pile-up does not prove physical overexposure',
-                                 'Noise estimates are single-image proxies', 'Latest frozen M1 is block-domain only'],
-                    code_sha256={str(p.relative_to(ROOT)): sha(p) for p in [Path(__file__),
-                        ROOT/'src/models/seamless_ghost.py', ROOT/'src/models/physics_model.py', ROOT/'src/utils/dicom_utils.py']})
-    (OUT/'selection.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-    # A single study makes all selected images visible together despite missing source UIDs.
-    study = generate_uid()
-    originals = {}
-    needed = sorted(set(cohort) | {i-1 for i in cohort if i > 1})
-    for idx in needed:
-        source = pydicom.dcmread(RAW/f'{idx}.dcm')
-        a = source.pixel_array
-        lo, hi = np.percentile(a, [0.5, 99.5])
-        source.WindowCenter, source.WindowWidth = float((lo+hi+1)/2), float(max(hi-lo+1, 2))
-        source.SeriesNumber, source.InstanceNumber = idx*10, 1
-        path = OUT/'dicom'/f'{idx:02d}_original.dcm'
-        audit = save_dicom(a, source, path, study_uid=study,
-                          series_description=f'{idx:02d} ORIGINAL PIXELS - research',
-                          derivation_description=f'Pixel-identical review copy of {idx}.dcm; source UIDs invalid/duplicated; file SHA256 in selection.json')
-        originals[idx] = pydicom.dcmread(path)
-        assert audit['clipped_low'] == audit['clipped_high'] == 0
-        assert np.array_equal(originals[idx].pixel_array, a)
-    results = []
-    for idx, reasons in sorted(cohort.items()):
-        before_ds = originals[idx]
-        before = before_ds.pixel_array.astype(np.float64)
-        previous = originals[idx-1].pixel_array.astype(np.float64) if idx > 1 else before
-        air, prev_obj = detect_air_mask(before), detect_object_mask(previous)
-        upper = 2**int(before_ds.BitsStored)-1
-        if idx == 1:
-            proposed, applied, reason = before.copy(), False, 'unchanged export control'
+
+def apply_frozen_m1(dark, prediction, evaluated, block_size=16):
+    """Lift the frozen OOF correction without altering within-block differences."""
+    dark = np.asarray(dark, dtype=np.float64)
+    prediction = np.asarray(prediction, dtype=np.float64)
+    evaluated = np.asarray(evaluated, dtype=bool)
+    if prediction.shape != evaluated.shape or dark.shape != tuple(n*block_size for n in prediction.shape):
+        raise ValueError('Full-resolution geometry must exactly match the frozen block grid')
+    if not np.isfinite(prediction[evaluated]).all():
+        raise ValueError('Non-finite prediction in evaluated blocks')
+    correction = np.repeat(np.repeat(np.where(evaluated, prediction, 0), block_size, axis=0), block_size, axis=1)
+    return dark-correction
+
+
+def load_m1_pair(manifest, light, dark):
+    row = next(r for r in manifest['pair_results'] if (r['light_index'], r['dark_index']) == (light, dark))
+    artifact = row['output_artifacts']['primary_maps']
+    path = ROOT/'outputs/mhinge_cross_pair_v1'/artifact['relative_path']
+    if not path.exists():
+        path = ROOT/'outputs/pseudo_ghost_mechanism_v1'/artifact['relative_path']
+    if sha(path) != artifact['sha256']:
+        raise ValueError(f'Frozen map hash mismatch: {path}')
+    with np.load(path) as z:
+        maps = {k: z[k].copy() for k in z.files}
+    if str(maps['background_mode']) != 'masked_hybrid_spline':
+        raise ValueError('Wrong frozen background mode')
+    bg = next(r for r in row['block_results'] if r['block_size'] == 16)
+    bg = next(r for r in bg['background_results'] if r['background_mode'] == 'masked_hybrid_spline')
+    result = next(r for r in bg['mask_results'] if r['mask_mode'] == 'exclude_saturated')
+    valid = maps['evaluated_mask'].astype(bool)
+    pred = maps['oof_prediction']
+    if not result['detection_gate']['passed'] or abs(result['fit']['alpha_fold_mean']) < 1e-4:
+        raise ValueError('Pair does not pass the frozen practical-effect gate')
+    if not np.allclose(maps['observable_signal'], maps['raw_dark']-maps['background'], atol=2e-4, rtol=0):
+        raise ValueError('Frozen Y identity failed')
+    if not np.allclose(maps['oof_residual'][valid], (maps['observable_signal']-pred)[valid], atol=2e-5, rtol=0):
+        raise ValueError('Frozen residual identity failed')
+    # Verify the stored prediction against the recorded fold-specific model.
+    for params in result['fit']['fold_parameters']:
+        mask = valid & (maps['spatial_folds'] == params['fold'])
+        expected = params['alpha']*maps['source'][mask]+params['intercept']
+        if not np.allclose(pred[mask], expected, atol=2e-5, rtol=1e-6):
+            raise ValueError('Frozen OOF prediction does not match model parameters')
+    return maps, result['fit'], dict(path=str(path.relative_to(ROOT)), sha256=sha(path))
+
+
+def m1_preview(light, dark, before, after, maps, output, window):
+    fig, axes = plt.subplots(2, 3, figsize=(13, 9))
+    wc, ww = window
+    for ax, a, title in zip(axes[0], (before, after, after-before),
+                            ('Original dark', 'M1 corrected dark', 'Correction: after - before')):
+        if title.startswith('Correction'):
+            limit = max(float(np.percentile(np.abs(a), 99.5)), 1)
+            ax.imshow(a[::4, ::4], cmap='coolwarm', vmin=-limit, vmax=limit)
         else:
-            res = remove_ghost_seamless(before, previous, clip_output=False)
-            proposed, applied, reason = res.cleaned, res.applied, res.reason
-        template = deepcopy(before_ds)
-        template.SeriesNumber = idx*10+1
-        path = OUT/'dicom'/f'{idx:02d}_processed.dcm'
-        audit = save_dicom(proposed, template, path, study_uid=study,
-                          series_description=f'{idx:02d} SEAMLESS LAG1 - research',
-                          derivation_description=f'Single-lag seamless exploratory review; applied={applied}; {reason}; not frozen M1',
-                          source_images=[before_ds] + ([originals[idx-1]] if idx > 1 else []))
-        after_ds = pydicom.dcmread(path)
-        after = after_ds.pixel_array.astype(np.float64)
-        for key in ('Rows','Columns','BitsAllocated','BitsStored','PixelRepresentation',
-                    'PhotometricInterpretation','WindowCenter','WindowWidth'):
-            assert before_ds.get(key) == after_ds.get(key), key
-        clean_air = binary_erosion(air & ~prev_obj, iterations=8)
-        roi = choose_roi(before, clean_air, upper)
-        noise = {'status': 'unverified: no valid unsaturated clean-air tile'}
-        if roi:
-            y,x,size = roi
-            nb, na = noise_stats(before[y:y+size,x:x+size]), noise_stats(after[y:y+size,x:x+size])
-            noise = dict(status='proxy only: input-selected lowest-variation tile', before=nb, after=na,
-                         highpass_std_ratio=na['highpass_std']/nb['highpass_std'] if nb['highpass_std'] > 0 else None)
-        obj = detect_object_mask(before)
-        gb = np.hypot(*np.gradient(gaussian_filter(before, 1)))
-        ga = np.hypot(*np.gradient(gaussian_filter(after, 1)))
-        edge = obj & (gb > np.percentile(gb[obj], 90)) if obj.any() else obj
-        edge_ratio = float(np.median(ga[edge])/np.median(gb[edge])) if edge.any() else None
-        b0, b1 = blocks(before), blocks(after)
-        ghost_blocks = blocks((air & prev_obj).astype(float)) > 0.95
-        sd0, sd1 = (float(np.std(b[ghost_blocks])) if ghost_blocks.any() else None for b in (b0,b1))
-        # Display windows are selected from the original only; both images share them.
-        global_window = [float(before_ds.WindowCenter), float(before_ds.WindowWidth)]
-        vals = before[air]
-        med = float(np.median(vals)) if vals.size else float(np.median(before))
-        spread = float(np.median(np.abs(vals-med))*1.4826) if vals.size else float(np.std(before))
-        windows = [global_window, [med, max(6*spread, 2)]]
-        preview(idx, before, after, roi, windows, OUT/f'{idx:02d}_comparison.png')
-        result = dict(index=idx, reasons=reasons, applied=applied, reason=reason,
-                      export=audit, noise_roi_y_x_size=roi, noise=noise, windows=windows,
-                      input_high_endpoint_fraction=float(np.mean(before==upper)),
-                      input_observed_maximum=float(before.max()),
-                      input_observed_max_fraction=float(np.mean(before==before.max())),
-                      output_above_input_maximum_pixels=int(np.sum(after>before.max())),
-                      coefficient_at_cap=('alpha=0.0500' in reason),
-                      output_high_endpoint_fraction=float(np.mean(after==upper)),
-                      newly_high_endpoint_pixels=int(np.sum((before<upper)&(after==upper))),
-                      newly_low_endpoint_pixels=int(np.sum((before>0)&(after==0))),
-                      regions={name:region_stats(before,after,mask) for name,mask in {
-                          'clean_air':clean_air,'candidate_ghost_air':air & prev_obj,
-                          'current_object':obj,'object_overlap':obj & prev_obj,
-                          'input_endpoints':(before==0)|(before==upper)}.items()},
-                      edge_gradient_ratio_proxy=edge_ratio,
-                      candidate_ghost_block_std_before=sd0,candidate_ghost_block_std_after=sd1,
-                      viewer_status='pending', detail_preservation_status='unverified without ground truth',
-                      processed_sha256=sha(path))
-        results.append(result)
-        print(f'frame {idx}: {reason}; clip={audit["clipped_low"]}/{audit["clipped_high"]}; noise={noise.get("highpass_std_ratio")}', flush=True)
-    # Confirm raw files stayed unchanged and all exported instances are unique.
-    assert all(sha(RAW/f'{r["index"]}.dcm') == r['sha256'] for r in rows)
-    # Remove only superseded files owned by this stable review generator.
-    expected = {f'{i:02d}_original.dcm' for i in needed} | {f'{i:02d}_processed.dcm' for i in cohort}
-    for p in (OUT/'dicom').glob('*.dcm'):
-        if p.name not in expected and p.stem.split('_')[0].isdigit() and p.stem.split('_')[-1] in ('original','processed'):
-            p.unlink()
-    for p in OUT.glob('*_comparison.png'):
-        if p.stem.split('_')[0].isdigit() and int(p.stem.split('_')[0]) not in cohort:
-            p.unlink()
-    files = sorted((OUT/'dicom').glob('*.dcm'))
-    ids = [str(pydicom.dcmread(p, stop_before_pixels=True).SOPInstanceUID) for p in files]
-    assert len(ids) == len(set(ids))
-    payload = dict(selection=manifest, results=results, raw_hashes_unchanged=True,
-                   exported_instances=len(files), unique_sop_uids=True,
-                   software_versions={m.__name__:m.__version__ for m in (np,pydicom,matplotlib)})
-    (OUT/'review_results.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2,allow_nan=False))
-    lines = ['# DICOM 第一批阅片检查', '',
-        '方法：早期 seamless，仅前一帧，探索性全分辨率输出；不是冻结 M1 的恢复验证。',
-        '原始数据只读。所有查看副本是 Secondary Capture，保留像素位深；原图副本像素完全一致。',
-        '原始 30 张图 UID 重复且缺少 Study/Series UID；查看副本分配独立标识，处理图引用对应查看副本。',
-        '来源文件和算法哈希见 selection.json，完整数值和局限见 review_results.json。', '',
-        '|帧|执行处理|系数碰上限|原图最大值堆积|导出前低/高越界像素|背景高频标准差比|边缘梯度比|阅片状态|',
-        '|---|---|---|---|---|---|---|---|']
-    for r in results:
-        ratio = r['noise'].get('highpass_std_ratio')
-        edge = r['edge_gradient_ratio_proxy']
-        nr = f'{ratio:.6f}' if ratio is not None else '未验证'
-        er = f'{edge:.6f}' if edge is not None else '未验证'
-        lines.append(f'|{r["index"]}|{r["applied"]}|{r["coefficient_at_cap"]}|{r["input_observed_max_fraction"]:.2%}|{r["export"]["clipped_low"]}/{r["export"]["clipped_high"]}|{nr}|{er}|待阅片|')
-    lines += ['', '## 如何查看', '',
-        '导入 dicom/ 全部文件。按帧号配对 ORIGINAL PIXELS 与 SEAMLESS LAG1；额外原图用于检查前序来源。',
-        '首先使用两图共享的默认窗宽窗位；再按 review_results.json 中 windows 的第二组数值同步调窗。',
-        '逐一检查物体重叠处、边缘、噪声纹理、亮暗斑和接缝，并记录结论。比较 PNG 的红框为同一背景 ROI。',
-        '', '## 解释边界', '',
-        '- 背景 ROI 从原图低变化空气区选取，可能低估全图噪声；邻差与高频统计只是代理。',
-        '- 高频标准差比或边缘梯度比接近 1 不能证明噪声和细节完全不变。',
-        '- 候选残影区的分块标准差包含背景和真实结构，不能当作残影去除率。',
-        '- 顶格像素不能单独证明过曝；未发现顶格也不能排除前端饱和。',
-        '- 最弱关联样本不是真实无残影对照；第 1 帧仅验证导出不改像素。',
-        '- 未获得 clean/previous/ghosted 三元组前，不报告恢复准确率。',
-        '- 本目录为当前稳定阅片输出；重运行覆盖同名结果。旧多帧结果不混入本包。']
-    (OUT/'review.md').write_text('\n'.join(lines)+'\n')
-    print(f'Written {OUT}: {len(results)} cases, {len(files)} DICOMs', flush=True)
+            ax.imshow(display_window(a, wc, ww)[::4, ::4], cmap='gray', vmin=0, vmax=1)
+        ax.set_title(title)
+    valid = maps['evaluated_mask'].astype(bool)
+    limit = max(float(np.percentile(np.abs(maps['observable_signal'][valid]), 99.5)), 1)
+    for ax, key, title in zip(axes[1], ('observable_signal', 'oof_prediction', 'oof_residual'),
+                             ('Frozen Y = dark - background', 'Frozen M1 OOF prediction', 'Frozen residual Y - prediction')):
+        im = ax.imshow(np.ma.array(maps[key], mask=~valid), cmap='coolwarm', vmin=-limit, vmax=limit)
+        ax.set_title(title)
+    fig.colorbar(im, ax=list(axes[1]), fraction=0.025, pad=0.02)
+    for ax in axes.ravel():
+        ax.axis('off')
+    fig.suptitle(f'{light}-light -> {dark}-dark | M1 frozen OOF | shared WC={wc:.2f}, WW={ww:.2f}')
+    fig.subplots_adjust(top=0.9, bottom=0.03, left=0.02, right=0.91, hspace=0.12)
+    fig.savefig(output, dpi=130)
+    plt.close(fig)
+
+
+def main():
+    import shutil
+    from datetime import datetime, timezone
+    manifest_path = ROOT/'outputs/mhinge_cross_pair_v1/analysis_results.json'
+    manifest = json.loads(manifest_path.read_text())
+    if not manifest.get('frozen_background', {}).get('verified'):
+        raise ValueError('Unverified frozen background')
+    config = manifest['configuration']
+    if config['block_sizes'] != [16] or config['background_modes'] != ['masked_hybrid_spline']:
+        raise ValueError('Expected frozen block16 masked-hybrid data')
+    pairs = ((3,4), (5,6), (27,28))
+    study = generate_uid()
+    # Build and verify in OS temp space before replacing superseded review files.
+    with tempfile.TemporaryDirectory(prefix='m1-dicom-review-') as staging:
+        stage = Path(staging)
+        records = []
+        for light, dark in pairs:
+            maps, fit, provenance = load_m1_pair(manifest, light, dark)
+            sources = {}
+            for index, kind in ((light, 'light'), (dark, 'dark')):
+                name = f'{index}-{kind}.dcm'
+                path = RAW/name
+                expected = manifest['input_provenance']['files'][name]['sha256']
+                if sha(path) != expected:
+                    raise ValueError(f'Raw DICOM hash mismatch: {name}')
+                ds = pydicom.dcmread(path)
+                if (ds.PhotometricInterpretation != 'MONOCHROME2' or ds.PixelRepresentation != 0
+                    or float(ds.get('RescaleSlope', 1)) != 1 or float(ds.get('RescaleIntercept', 0)) != 0
+                    or 'ModalityLUTSequence' in ds or 'VOILUTSequence' in ds or 'PixelPaddingValue' in ds):
+                    raise ValueError(f'Unsupported stored pixel semantics: {name}')
+                sources[kind] = ds
+            before = sources['dark'].pixel_array.astype(np.float64)
+            if not np.allclose(blocks(before), maps['raw_dark'], atol=0.002, rtol=0):
+                raise ValueError('Raw dark does not match frozen block data')
+            source_blocks = blocks(sources['light'].pixel_array.astype(np.float64))
+            source_blocks -= np.percentile(source_blocks, 75)
+            if not np.allclose(source_blocks, maps['source'], atol=0.002, rtol=0):
+                raise ValueError('Raw light does not match frozen centered source')
+            proposed = apply_frozen_m1(before, maps['oof_prediction'], maps['evaluated_mask'])
+            valid = maps['evaluated_mask'].astype(bool)
+            if not np.allclose(blocks(proposed)[valid], (maps['raw_dark']-maps['oof_prediction'])[valid], atol=0.002, rtol=0):
+                raise ValueError('Full-size correction does not reproduce frozen block subtraction')
+            # Input-only window highlights the low-amplitude ghost in dark images.
+            lo, hi = np.percentile(before, [0.5, 99.5])
+            window = [float((lo+hi+1)/2), float(max(hi-lo+1, 2))]
+            copies = {}
+            for kind in ('light', 'dark'):
+                ds = deepcopy(sources[kind])
+                if kind == 'dark':
+                    ds.WindowCenter, ds.WindowWidth = window
+                else:
+                    a,b = np.percentile(ds.pixel_array, [0.5,99.5])
+                    ds.WindowCenter, ds.WindowWidth = float((a+b+1)/2), float(max(b-a+1,2))
+                ds.SeriesNumber, ds.InstanceNumber = dark*10+(kind=='dark'), 1
+                filename = f'pair_{light}_{dark}_{kind}_original.dcm'
+                audit = save_dicom(ds.pixel_array, ds, stage/'dicom'/filename, study_uid=study,
+                    series_description=f'{light}->{dark} ORIGINAL {kind.upper()} - research',
+                    derivation_description='Pixel-identical copy; source file SHA256 in review_results.json')
+                copies[kind] = pydicom.dcmread(stage/'dicom'/filename)
+                assert np.array_equal(copies[kind].pixel_array, sources[kind].pixel_array)
+            ds = deepcopy(copies['dark'])
+            ds.SeriesNumber = dark*10+2
+            filename = f'pair_{light}_{dark}_dark_m1.dcm'
+            audit = save_dicom(proposed, ds, stage/'dicom'/filename, study_uid=study,
+                series_description=f'{light}->{dark} M1 OOF CORRECTED DARK - research',
+                derivation_description='Dark minus frozen M1 OOF prediction; constant correction per 16x16 block; BG retained; unevaluated blocks unchanged',
+                source_images=[copies['dark'], copies['light']])
+            after_ds = pydicom.dcmread(stage/'dicom'/filename)
+            after = after_ds.pixel_array.astype(np.float64)
+            assert (float(after_ds.WindowCenter), float(after_ds.WindowWidth)) == tuple(window)
+            quantization_target = np.clip(proposed, 0, 2**int(ds.BitsStored)-1)
+            assert np.max(np.abs(after-quantization_target)) <= 0.5+1e-8
+            m1_preview(light, dark, before, after, maps, stage/f'pair_{light}_{dark}_comparison.png', window)
+            records.append(dict(pair=f'{light}->{dark}', frozen_maps=provenance,
+                inputs={f'{i}-{k}.dcm':sha(RAW/f'{i}-{k}.dcm') for i,k in ((light,'light'),(dark,'dark'))},
+                fit=fit, window=window, export=audit, processed_sha256=sha(stage/'dicom'/filename),
+                evaluated_blocks=int(valid.sum()), unchanged_blocks=int((~valid).sum()),
+                max_quantization_error=float(np.max(np.abs(after-quantization_target))),
+                max_storage_clipping_change=float(np.max(np.abs(proposed-quantization_target))),
+                correction_range=[float((before-proposed).min()),float((before-proposed).max())]))
+            print(f"{light}->{dark}: R2={fit['cv_r2']:.6f}; clipping={audit['clipped_low']}/{audit['clipped_high']}; DICOM verified", flush=True)
+        uids = [str(pydicom.dcmread(p,stop_before_pixels=True).SOPInstanceUID) for p in (stage/'dicom').glob('*.dcm')]
+        assert len(uids) == len(set(uids)) == 9
+        report = dict(generated_at=datetime.now(timezone.utc).isoformat(), method='frozen M1 strict spatial OOF',
+            correction='D - nearest-block lift of frozen OOF prediction; background retained; invalid blocks unchanged',
+            evidence_scope='Block16 model; full-size export preserves within-block texture and may expose block boundaries; no clean ground truth',
+            manifest_sha256=sha(manifest_path), code_sha256=sha(Path(__file__)), pairs=records)
+        (stage/'review_results.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
+        lines = ['# M1 DICOM 阅片', '', '使用冻结四折空间 OOF 预测。输出为 dark−预测残影，保留 BG。',
+                 '每个 16×16 block 使用常数修正，不重新拟合、不插值；无效 block 保持原样。',
+                 '原 dark 与处理后 dark 的窗宽窗位相同；全尺寸导出未新增像素级模型验证。', '',
+                 '每对包含前序 light 原图、目标 dark 原图、M1 修正 dark，共 9 个 DICOM。', '',
+                 '| Pair | OOF R² | 对比图 |', '|---|---:|---|']
+        lines += [f'| {r["pair"]} | {r["fit"]["cv_r2"]:.6f} | pair_{r["pair"].replace("->","_")}_comparison.png |' for r in records]
+        (stage/'review.md').write_text('\n'.join(lines)+'\n')
+        OUT.mkdir(parents=True, exist_ok=True)
+        # This stable directory owns only review derivatives, not frozen evidence.
+        for path in OUT.iterdir():
+            if path.name == 'dicom' and path.is_dir():
+                shutil.rmtree(path)
+            elif path.is_file() and (path.suffix in ('.png', '.json') or path.name == 'review.md'):
+                path.unlink()
+        for path in stage.iterdir():
+            shutil.move(str(path), OUT/path.name)
+    print(f'Results: {OUT}')
 
 
 if __name__ == '__main__':

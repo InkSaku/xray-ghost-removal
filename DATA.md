@@ -214,3 +214,25 @@ BG 冻结配置位于 `configs/background_frozen_v1.json`。该配置依赖本�
 `outputs/` 已由 `.gitignore` 排除。不要使用 `git add -f outputs/` 绕过该边界；确需提交汇总产物时，应先检查文件大小、敏感头信息和长期复用价值。原始 DICOM 必须保持只读，不得为了分析方便覆盖或改名。
 
 后续分析使用稳定的输出路径：同一科学定义下的新运行应在核对用途后覆盖旧结果，不按日期或实验轮次无限新建目录。一次性调试、渲染检查和测试产物必须使用系统临时目录或 pytest `tmp_path`。只有科学定义或冻结证据边界发生变化时才新建版本化输出，并必须说明保留旧版本的原因。
+
+当前阅片输出稳定写入 `outputs/dicom_review/`，由
+`python scripts/prepare_dicom_review.py` 重现。已替换早期 seamless 结果，当前仅包含
+`3-light→4-dark`、`5-light→6-dark`、`27-light→28-dark` 的原 light、原 dark 和
+M1 修正 dark（共 9 个全尺寸 DICOM）、3 张对比图、`review_results.json` 和 `review.md`。
+导出直接读取并核验已有冻结 block16 NPZ 与原 DICOM 哈希；`3→4` 缺失的 NPZ 使用
+`pseudo_ghost_mechanism_v1` 中哈希相同的副本。每个有效 block 的冻结四折 OOF
+预测常数减到对应 16×16 原始像素上，保留 BG 与块内纹理，不重拟合、不插值；
+未评价 block 保持原样。这是 block16 M1 的全尺寸阅片导出，可能出现 block/折边界，
+不是新增的像素级模型。原 dark 和修正 dark 使用相同窗宽窗位。旧阅片派生产物已删除，
+原始数据、冻结配置、SAM archive 与既有科学审计记录保留。
+
+曝光研究启动前的原始数据审查复用
+`outputs/mhinge_cross_pair_v1/exposure_association/data_feasibility.{json,md,png}`。
+方法记录为 `docs/plans/exposure-data-feasibility.md`，复现命令：
+`.venv/bin/python scripts/audit_exposure_feasibility.py --diagnostic-dir /tmp/xray-exposure-feasibility`。
+脚本只读解码并核验全部62张原图、参数表和13对冻结NPZ，原图接触表写入指定临时目录。
+当前3个低最大值堆积且通过实用效应门槛的主样本为3→4、5→6、27→28；4→5、6→7保留
+为未检出对照。其他6个有效pair存在source截断风险，不能与主样本直接混合标定曝光系数。
+原始62张共用SOPInstanceUID；31张light最大值均为55000，24张堆积超过全图1%。
+这些是新核验的数据质量事实，不修改原图或已冻结审计。现有数据缺少同物体、同状态、
+可重复的曝光梯度，不足以归因曝光效应或建立曝光相关alpha函数。

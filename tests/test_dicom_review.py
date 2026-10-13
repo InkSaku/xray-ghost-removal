@@ -104,3 +104,26 @@ def test_roi_excludes_empirical_plateau():
     a = np.ones((128,128))*100
     a[:64,:64] = 55000
     assert choose_roi(a,np.ones_like(a,dtype=bool),65535) == [0,64,64]
+
+
+def test_m1_lift_preserves_texture_and_unevaluated_blocks():
+    from scripts.prepare_dicom_review import apply_frozen_m1
+    dark = np.arange(24, dtype=float).reshape(4, 6) + 100
+    prediction = np.array([[3., np.nan, -2.], [1., 4., 5.]])
+    valid = np.array([[True, False, True], [True, True, True]])
+    after = apply_frozen_m1(dark, prediction, valid, block_size=2)
+    np.testing.assert_array_equal(after[:2, 2:4], dark[:2, 2:4])
+    np.testing.assert_allclose(after[:2, :2], dark[:2, :2]-3)
+    np.testing.assert_allclose(after[:2, 4:], dark[:2, 4:]+2)
+    for y in (0,2):
+        for x in (0,2,4):
+            np.testing.assert_allclose(np.diff(after[y:y+2,x:x+2],axis=1),
+                                       np.diff(dark[y:y+2,x:x+2],axis=1))
+
+
+def test_m1_lift_rejects_geometry_and_valid_nan():
+    from scripts.prepare_dicom_review import apply_frozen_m1
+    with pytest.raises(ValueError, match='geometry'):
+        apply_frozen_m1(np.zeros((3,4)), np.zeros((2,2)), np.ones((2,2),bool), 2)
+    with pytest.raises(ValueError, match='Non-finite'):
+        apply_frozen_m1(np.zeros((4,4)), np.full((2,2),np.nan), np.ones((2,2),bool), 2)
