@@ -1,12 +1,13 @@
 # Data, transferred separately, see DATA.md
-data/
+/data/
 *.dcm
+*.raw
 
 # Outputs
-outputs/
-results/
-figures/
-experiments/
+/outputs/
+/results/
+/figures/
+/experiments/
 *.pt
 *.pth
 *.ckpt
@@ -15,6 +16,7 @@ experiments/
 __pycache__/
 *.py[cod]
 .venv/
+*.egg-info/
 venv/
 
 # OS and editor

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xray-ghost-removal"
+version = "0.1.0"
+description = "DR single-frame ghost research, M1 baseline, and inherited methods"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pydicom>=2.4",
+  "matplotlib>=3.7",
+  "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.3"]
+legacy = ["torch>=2.0"]
+
+[project.scripts]
+xray = "xray_ghost_removal.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xray_ghost_removal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
