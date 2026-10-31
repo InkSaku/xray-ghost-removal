@@ -42,6 +42,10 @@ python -m pytest -q
 | RAW整批导入Horos | `python run.py data export-raw-dicom`，将生成的 `outputs/raw_intake/dicom/` 整个目录导入Horos |
 | RAW上的M1跨配对检验 | `python run.py research raw-m1`，设计见 `docs/plans/2026-10-30-raw-m1-cross-pair.md` |
 | RAW顶格/未顶格分区模型Msplit | `python run.py research raw-split`，设计见 `docs/plans/2026-10-30-raw-split-model.md` |
+| RAW未顶格区响应形状（NLCSC式/幂律） | `python run.py research raw-response`，设计见 `docs/plans/2026-10-31-raw-response-shape.md` |
+| RAW未顶格区位置与邻近规律 | `python run.py research raw-unclipped`，设计见 `docs/plans/2026-10-31-raw-unclipped-laws.md` |
+| RAW顶格区边缘衰减模型Medge | `python run.py research raw-edge`，设计见 `docs/plans/2026-10-31-raw-plateau-edge.md` |
+| RAW边缘衰减随相邻亮度变化Mcontrast | `python run.py research raw-edge-contrast`，设计见 `docs/plans/2026-10-31-raw-edge-contrast.md` |
 | 读取冻结M1并导出阅片 | `python run.py m1 review` |
 | 半合成演示与精选展示 | `python run.py m1 simulate` / `python run.py m1 presentation` |
 | 既有seamless去除样例 | `python run.py legacy remove --indices 4,6,18` |
@@ -52,7 +56,7 @@ python -m pytest -q
 ## 当前研究边界
 
 - 设备已确认为DR平板；存量DICOM的 `Modality=CR` 保留为文件头事实。
-- 2026-10-30新增142张RAW，有70组高值→低值配对；格式暂按3072×3072、小端uint16读取。帧角色、目录时间字段和处理链未确认，确认清单已整理、待设备方回复。以两张开头低值帧作干净暗帧，M1跨配对检验（RESULTS第9节）显示参数可迁移、仿射形式不充分；按预设门槛，顶格/未顶格分区模型Msplit已晋升为这批RAW的新基线（RESULTS第10节），仍不含时间项。M1仍是DICOM研究的基线，代码未改。
+- 2026-10-30新增142张RAW，有70组高值→低值配对；格式暂按3072×3072、小端uint16读取。帧角色、目录时间字段和处理链未确认，确认清单已整理、待设备方回复。以两张开头低值帧作干净暗帧，M1跨配对检验（RESULTS第9节）显示参数可迁移、仿射形式不充分；按预设门槛，顶格/未顶格分区模型Msplit已晋升为这批RAW的新基线（RESULTS第10节），仍不含时间项；NLCSC式饱和曲线与幂律都未能取代它（RESULTS第11节）；只看未顶格块时，残影与曝光的关系弱且逐组不稳定，位置与邻近规律均未成立（RESULTS第12节）。顶格像素越靠近物体边缘残影越弱，加入这一衰减的Medge通过全部预设门槛，现为这批RAW的基线（RESULTS第13节）；让衰减随相邻像素亮度变化的Mcontrast未通过门槛（RESULTS第14节）。后续只基于现有数据推进，不依赖补采。M1仍是DICOM研究的基线，代码未改。
 - 当前分割保持阈值/SAM掩膜边界，禁止膨胀、填孔或扩大排除区。新的M1拟合默认写入 `outputs/m1/`，并拒绝覆盖历史冻结目录。
 - 历史 `background_frozen_v1.json` 使用24像素膨胀，其配置、SAM归档和审计原样保留。旧冻结NPZ可用于既有比较；当前实现不能重建其掩膜定义。历史BG审计保留作证据代码，不能直接重跑旧膨胀网格。
 - M1是存储像素/分块域的经验模型。`Y = dark - estimated_background` 包含噪声和背景误差；真实恢复率、物理衰减和曝光因果结论仍需要相应参考与采集记录。数字统一见RESULTS。

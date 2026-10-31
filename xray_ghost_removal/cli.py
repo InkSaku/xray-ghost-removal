@@ -50,6 +50,10 @@ COMMANDS = {
         'exposure-plot': Command('research.exposure_plot', 'Plot the four existing repeated exposure settings.', False),
         'raw-m1': Command('research.raw_m1', 'Test M1 cross-pair prediction on the 10.30 RAW batch against clean darks.'),
         'raw-split': Command('research.raw_split', 'Compare the plateau/unclipped split model with M1 on the 10.30 RAW batch.'),
+        'raw-response': Command('research.raw_response', 'Test NLCSC-style and power-law unclipped responses against Msplit.'),
+        'raw-unclipped': Command('research.raw_unclipped', 'Test position and plateau-proximity ghost laws on unclipped blocks only.'),
+        'raw-edge': Command('research.raw_edge', 'Test plateau ghost attenuation near object edges against Msplit.'),
+        'raw-edge-contrast': Command('research.raw_edge_contrast', 'Test edge attenuation that depends on neighbor brightness against Medge.'),
     },
 }
 

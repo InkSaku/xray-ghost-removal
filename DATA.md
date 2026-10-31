@@ -150,6 +150,22 @@ DICOM使用合成的 `RAW^REVIEW` / `XRAY-RAW-REVIEW` 查看标识；原文件�
 
 另增一项逐块输入：高值帧中不等于55000的像素平均值减去 `D`（完全顶格的块为空），用于边界块混合；只做阈值和平均，不做形态学操作。JSON记录三个模型的逐配对指标、位置图稳定性、输入SHA-256和代码哈希；位置图本身只画在汇总图中，不另存数组。
 
+### 未顶格区响应形状
+
+`.venv/bin/python run.py research raw-response` 使用与Msplit完全相同的输入和留一配对方案，只替换未顶格部分的函数，稳定覆盖 `outputs/raw_response_v1/` 中的 `results.json`、`pairs.csv` 和 `diagnostics.png`。候选集合与研究问题不同于Msplit，因此不覆盖 `outputs/raw_split_v1/`。
+
+### 未顶格区规律
+
+`.venv/bin/python run.py research raw-unclipped` 只使用前一帧完全未顶格（`s=0`）的分块，`Y` 与解释变量逐配对去中心，稳定覆盖 `outputs/raw_unclipped_v1/` 中的 `results.json`、`pairs.csv` 和 `diagnostics.png`。邻近项是前一帧顶格比例的高斯平滑，只作解释变量，不删减任何分块。
+
+### 顶格区边缘衰减模型Medge
+
+`.venv/bin/python run.py research raw-edge` 在Msplit的输入之外，重新只读读取70张高值帧，在全分辨率上计算每个顶格像素到最近非顶格像素的距离，汇总为逐块特征；距离只作解释变量，不删减任何像素或分块。稳定覆盖 `outputs/raw_edge_v1/` 中的 `results.json`、`pairs.csv` 和 `diagnostics.png`，不覆盖 `outputs/raw_split_v1/`。单次运行约1分钟。
+
+### 边缘衰减随相邻亮度变化
+
+`.venv/bin/python run.py research raw-edge-contrast` 在Medge的距离变换上同时取每个顶格像素最近的非顶格像素值，生成相邻亮度特征，并在同一次运行中重新拟合Medge作对照；稳定覆盖 `outputs/raw_edge_contrast_v1/` 中的 `results.json`、`pairs.csv` 和 `diagnostics.png`。单次运行约3分钟。
+
 ## 尚未交付的协议化DR控制数据
 
 本轮不是当前物体真实曝光图的三元组，而是单次曝光后无新曝光的暗读出控制实验。已确定A有物体8组、B无遮挡3档×3次共9组、S无曝光流程对照2组，共19个独立循环、17次实际曝光、169张核心图像；可选dark_03/04全部保留时203张。两组低/高试拍合格时抵扣正式组，不重复计数。

@@ -55,18 +55,23 @@ class PairData:
     s: np.ndarray      # plateau pixel fraction
 
 
-def learn_map(ys: list[np.ndarray], ss: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Average Y over training pairs where the block is fully plateau.
+def learn_map(ys: list[np.ndarray], ss: list[np.ndarray],
+              ms: list[np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Least-squares G per block over training pairs where the block is fully plateau.
 
-    Blocks with fewer than MIN_MAP_SAMPLES samples are filled from observed blocks
-    only, with increasing smoothing; observed values are never altered.
+    Without multipliers this is the plain average of Y. With multipliers m (model
+    Y = G*m) it is sum(Y*m) / sum(m^2). Blocks with fewer than MIN_MAP_SAMPLES
+    samples are filled from observed blocks only, with increasing smoothing;
+    observed values are never altered.
     """
     full = np.stack(ss) == 1.0
     count = full.sum(axis=0)
-    total = np.where(full, np.stack(ys), 0.0).sum(axis=0)
+    m = np.ones(full.shape) if ms is None else np.stack(ms)
+    total = np.where(full, np.stack(ys) * m, 0.0).sum(axis=0)
+    weight = np.where(full, m * m, 0.0).sum(axis=0)
     observed = count >= MIN_MAP_SAMPLES
     with np.errstate(invalid='ignore', divide='ignore'):
-        g = np.where(observed, total / count, np.nan)
+        g = np.where(observed, total / weight, np.nan)
     missing = ~observed
     for sigma in FILL_SIGMAS:
         if not missing.any():
