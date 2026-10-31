@@ -20,6 +20,7 @@ class Command:
 COMMANDS = {
     'data': {
         'inspect-raw': Command('data.raw_intake', 'Inventory and preview a RAW batch under an explicit layout assumption.'),
+        'export-raw-dicom': Command('data.raw_dicom', 'Package an inventoried RAW batch for bulk DICOM import into Horos.'),
     },
     'legacy': {
         'remove': Command('legacy.remove', 'Run the inherited seamless remover (nearest previous frame by default).'),

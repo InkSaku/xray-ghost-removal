@@ -130,6 +130,14 @@ Rescale 或读片处理描述。现在只能推测探测器状态、复位、读
   --data-dir '10.30例图' --shape 3072 3072 --dtype '<u2'
 ```
 
+### 整批Horos阅片
+
+运行 `.venv/bin/python run.py data export-raw-dicom`，读取上述初检inventory，核对当前RAW文件集合、大小及逐文件SHA-256后，将142张RAW封装为 `outputs/raw_intake/dicom/` 下的142张单帧DICOM。该目录是本批阅片副本的稳定路径，没有旧阅片前身；重复运行仅替换本命令生成的完整导入包，不修改inventory、原始RAW或既有冻结证据。导入Horos时选择整个 `dicom/` 目录，无需逐张导入。
+
+原三个目录各对应一个study，每组按初检的观测高/低值类别分为两条series，共3个study、6条series；序列内按原文件名顺序浏览，InstanceNumber保留分组前的原始顺序号。高低值只是观测分类，不认证light/dark采集角色。每条series使用其输入帧采样P1–P99范围的共同显示窗，16位存储像素逐点保留，不做缩放、校正、旋转或重采样。`manifest.json`保存RAW/DICOM哈希、唯一UID、序号映射、显示窗和逐张像素读回核验。
+
+DICOM使用合成的 `RAW^REVIEW` / `XRAY-RAW-REVIEW` 查看标识；原文件名保存在ImageComments及manifest中。StudyDate/StudyTime留空，不将文件名时间或目录参数填成AcquisitionTime、曝光参数、像素间距等采集事实；创建时间只记录封装事件。沿用初检的未确认格式与方向假设，导入包不增加科学验证结论。
+
 ## 尚未交付的协议化DR控制数据
 
 本轮不是当前物体真实曝光图的三元组，而是单次曝光后无新曝光的暗读出控制实验。已确定A有物体8组、B无遮挡3档×3次共9组、S无曝光流程对照2组，共19个独立循环、17次实际曝光、169张核心图像；可选dark_03/04全部保留时203张。两组低/高试拍合格时抵扣正式组，不重复计数。

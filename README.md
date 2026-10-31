@@ -39,6 +39,7 @@ python -m pytest -q
 | 查看M1入口 | `python run.py m1 --help` |
 | 当前无膨胀M1拟合参数 | `python run.py m1 fit --help` |
 | 新RAW初检 | `python run.py data inspect-raw --data-dir '10.30例图' --shape 3072 3072 --dtype '<u2'` |
+| RAW整批导入Horos | `python run.py data export-raw-dicom`，将生成的 `outputs/raw_intake/dicom/` 整个目录导入Horos |
 | 读取冻结M1并导出阅片 | `python run.py m1 review` |
 | 半合成演示与精选展示 | `python run.py m1 simulate` / `python run.py m1 presentation` |
 | 既有seamless去除样例 | `python run.py legacy remove --indices 4,6,18` |
