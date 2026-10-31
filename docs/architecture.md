@@ -4,11 +4,11 @@
 
 ## 模块边界
 
-- `common`：DICOM、阈值分割、空间分块与fold、曝光表、路径和溯源。只依赖基础库，不导入具体方法或研究。
+- `common`：DICOM、无头RAW读取（`raw.py`）、阈值分割、空间分块与fold、曝光表、路径和溯源。只依赖基础库，不导入具体方法或研究。
 - `legacy`：既有物理修补、线性门控、seamless、合成数据与U-Net。依赖common。
 - `m1`：`config.py`保存现有参数和验证；`segmentation.py`负责掩膜加载/SAM；`background.py`负责背景与固定图样；`fitting.py`负责仿射拟合、严格空间OOF和检出；`validation.py`负责遮挡验证；`reporting.py`负责图表和汇总；`pipeline.py`只组织运行。依赖common，不导入研究候选或legacy。
-- `research`：配对核验、非线性、跨pair审查、迁移和曝光分析。依赖common和M1；候选逻辑不得反向写入基线；历史背景、逐折和覆盖审查统一放在其audits子包。
-- `data`：数据接收与格式检查。依赖common。
+- `research`：配对核验、非线性、跨pair审查、迁移和曝光分析；10.30 RAW研究中，`raw_cohort.py`负责帧读取、配对、干净暗帧与评分，`raw_m1.py`检验M1跨配对预测，`raw_split.py`实现顶格/未顶格分区模型Msplit及其与M1的比较。依赖common和M1；候选逻辑不得反向写入基线；历史背景、逐折和覆盖审查统一放在其audits子包。
+- `data`：数据接收与格式检查；`raw_dicom.py`读取初检清单并复用common的DICOM写入/读回，生成整批Horos阅片副本。依赖common。
 - `cli.py`：惰性选择命令，统一相对路径基准；无参数任务的帮助不会启动导出。只有legacy训练/诊断加载PyTorch。
 
 测试按 `tests/legacy`、`tests/m1`、`tests/research`、`tests/data` 组织；`tests/test_cli.py`检查入口、依赖方向和冻结路径保护。依赖只在pyproject.toml维护，仓库采用可编辑安装；原始影像和冻结产物不随Python包分发。

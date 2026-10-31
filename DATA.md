@@ -130,6 +130,26 @@ Rescale 或读片处理描述。现在只能推测探测器状态、复位、读
   --data-dir '10.30例图' --shape 3072 3072 --dtype '<u2'
 ```
 
+### 整批Horos阅片
+
+运行 `.venv/bin/python run.py data export-raw-dicom`，读取上述初检inventory，核对当前RAW文件集合、大小及逐文件SHA-256后，将142张RAW封装为 `outputs/raw_intake/dicom/` 下的142张单帧DICOM。该目录是本批阅片副本的稳定路径，没有旧阅片前身；重复运行仅替换本命令生成的完整导入包，不修改inventory、原始RAW或既有冻结证据。导入Horos时选择整个 `dicom/` 目录，无需逐张导入。
+
+原三个目录各对应一个study，每组按初检的观测高/低值类别分为两条series，共3个study、6条series；序列内按原文件名顺序浏览，InstanceNumber保留分组前的原始顺序号。高低值只是观测分类，不认证light/dark采集角色。每条series使用其输入帧采样P1–P99范围的共同显示窗，16位存储像素逐点保留，不做缩放、校正、旋转或重采样。`manifest.json`保存RAW/DICOM哈希、唯一UID、序号映射、显示窗和逐张像素读回核验。
+
+DICOM使用合成的 `RAW^REVIEW` / `XRAY-RAW-REVIEW` 查看标识；原文件名保存在ImageComments及manifest中。StudyDate/StudyTime留空，不将文件名时间或目录参数填成AcquisitionTime、曝光参数、像素间距等采集事实；创建时间只记录封装事件。沿用初检的未确认格式与方向假设，导入包不增加科学验证结论。
+
+### M1跨配对检验
+
+`.venv/bin/python run.py research raw-m1` 直接只读读取142张RAW，稳定覆盖 `outputs/raw_m1_v1/` 中的 `results.json`、`pairs.csv` 和 `diagnostics.png`。该目录是本批第一份建模结果，数据集与证据边界都不同于既有DICOM研究，所以单独版本化；同一定义重运行原地覆盖。
+
+输入契约：两张预先指定的开头低值帧 `20000039`、`200000C0` 的16×16分块均值平均作干净暗帧 `D`，`X=高值帧−D`、`Y=低值帧−D`；源平台分层只按像素等于55000的比例计数，不做形态学操作。`Y` 仍含读出噪声和两张暗帧之间约44计数的漂移。JSON记录142个输入SHA-256、代码哈希和逐配对参数；不写出任何图像副本。
+
+### 顶格/未顶格分区模型Msplit
+
+`.venv/bin/python run.py research raw-split` 使用与M1检验相同的输入、干净暗帧和70组配对，稳定覆盖 `outputs/raw_split_v1/` 中的 `results.json`、`pairs.csv`、`diagnostics.png` 和 `six_panel.png`。科学定义不同于M1检验，因此不覆盖 `outputs/raw_m1_v1/`。
+
+另增一项逐块输入：高值帧中不等于55000的像素平均值减去 `D`（完全顶格的块为空），用于边界块混合；只做阈值和平均，不做形态学操作。JSON记录三个模型的逐配对指标、位置图稳定性、输入SHA-256和代码哈希；位置图本身只画在汇总图中，不另存数组。
+
 ## 尚未交付的协议化DR控制数据
 
 本轮不是当前物体真实曝光图的三元组，而是单次曝光后无新曝光的暗读出控制实验。已确定A有物体8组、B无遮挡3档×3次共9组、S无曝光流程对照2组，共19个独立循环、17次实际曝光、169张核心图像；可选dark_03/04全部保留时203张。两组低/高试拍合格时抵扣正式组，不重复计数。

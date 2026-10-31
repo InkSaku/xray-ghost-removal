@@ -20,6 +20,7 @@ class Command:
 COMMANDS = {
     'data': {
         'inspect-raw': Command('data.raw_intake', 'Inventory and preview a RAW batch under an explicit layout assumption.'),
+        'export-raw-dicom': Command('data.raw_dicom', 'Package an inventoried RAW batch for bulk DICOM import into Horos.'),
     },
     'legacy': {
         'remove': Command('legacy.remove', 'Run the inherited seamless remover (nearest previous frame by default).'),
@@ -47,6 +48,8 @@ COMMANDS = {
         'exposure': Command('research.exposure', 'Analyze exposure associations in the frozen 13-pair cohort.'),
         'exposure-audit': Command('research.exposure_audit', 'Read-only audit of the original DICOM files and exposure records.'),
         'exposure-plot': Command('research.exposure_plot', 'Plot the four existing repeated exposure settings.', False),
+        'raw-m1': Command('research.raw_m1', 'Test M1 cross-pair prediction on the 10.30 RAW batch against clean darks.'),
+        'raw-split': Command('research.raw_split', 'Compare the plateau/unclipped split model with M1 on the 10.30 RAW batch.'),
     },
 }
 
